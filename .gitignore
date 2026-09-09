@@ -1,0 +1,22 @@
+# ===== 大型数据 / 备份（不入库） =====
+AesRecon.zip
+data_batch.zip
+*.tar.gz
+7dimensions_0831.tar.gz
+
+# ===== 密钥与环境（绝不入库） =====
+7dimensions/.env
+**/.env
+!.env.example
+
+# ===== 数据软链 / 生成物 / 缓存 =====
+7dimensions/dataset/
+7dimensions/dataset
+**/output/
+**/__pycache__/
+*.pyc
+*.egg-info/
+
+# ===== 本地杂项 =====
+.DS_Store
+*.log
