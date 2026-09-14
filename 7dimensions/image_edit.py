@@ -18,7 +18,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (IMAGE_EDIT_MAX_WORKERS, IMAGE_EDIT_MODEL,  # noqa: E402
-                    IMAGE_EDIT_SIZE, QWEN_API_KEY)
+                    IMAGE_EDIT_SIZE, qwen_api_key)
 
 DASHSCOPE_MM_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 
@@ -53,7 +53,7 @@ def edit_image(img, prompt: str, model: str = IMAGE_EDIT_MODEL,
     for attempt in range(max_retries):
         resp = requests.post(
             DASHSCOPE_MM_URL,
-            headers={"Authorization": f"Bearer {QWEN_API_KEY}",
+            headers={"Authorization": f"Bearer {qwen_api_key()}",
                      "Content-Type": "application/json"},
             json=body, timeout=300,
         )

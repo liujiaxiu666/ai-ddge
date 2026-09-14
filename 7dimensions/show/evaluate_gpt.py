@@ -24,13 +24,26 @@ GPT 视觉评估：基于【原图】核对每张测试图每份方案、每个�
 访问 OpenAI 需走代理（本机默认 http://127.0.0.1:30000，可用 --proxy 覆盖）；
 OpenAI key 无余额时可用 --provider gemini（key 读 backend/.env 的 GEMINI_API_KEY，可达且当前有额度）。
 
-用法示例：
-  python gpt_evaluate.py                                  # 评估 output/0907_sv（openai/gpt-4o-mini）
-  python gpt_evaluate.py --results-dir output/0907_sv_FIRST_GOOD_PER_POOR
-  python gpt_evaluate.py --provider gemini --model gemini-2.5-flash
-  python gpt_evaluate.py --limit 3 --max-solutions 2      # 快速试跑
-  python gpt_evaluate.py --model gpt-4o --concurrency 4
+cd /workspace/ai-ddge/7dimensions/show
+HTTPS_PROXY=http://127.0.0.1:30000 python evaluate_gpt.py \
+  --input-image /workspace/ai-camera-coach-app/backend/test_data/0715/flower100_20  \
+  --results-dir /workspace/ai-ddge/7dimensions/output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1 \
+  --out-dir /workspace/ai-ddge/7dimensions/output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1/gemini2.5flash_eval \
+  --provider gemini --model gemini-2.5-flash --concurrency 3
+
+（原图默认从 solutions.json 的 input_image 字段读；找不到时可用 --input_image 指定原图文件
+  或它的目录，也可用 --data-root 指定回退根目录。）
+
+cd /workspace/ai-ddge/7dimensions/show
+HTTPS_PROXY=http://127.0.0.1:30000 python evaluate_gpt.py \
+  --results-dir /workspace/ai-ddge/7dimensions/output/0907_sv \
+  --out-dir     /workspace/ai-ddge/7dimensions/output/0907_sv/gpt54_eval \
+  --provider openai --model gpt-5.4 --concurrency 3 --limit 10
+
 """
+
+
+
 from __future__ import annotations
 
 import argparse
@@ -58,18 +71,26 @@ DIM_CN = {
 }
 LABELS = ("correct", "wrong", "partial")
 
-# 方案正文里 “- 中文名/中文名整改：xxx” 的前缀识别
-_DIM_RE = (r"^(画面比例|构图取景|机位视角|主体位置|姿态动作|姿态|对焦景深|对焦|色彩光影|色彩)"
-           r"\s*(?:整改)?\s*[：:]\s*(.*)$")
+# 方案正文里 “- 中文名/中文名整改：xxx” 的前缀识别（先剥 markdown 加粗，再按冒号前的标签找维度）
+_LABEL_RE = re.compile(r"^([^：:]{1,24})[：:]\s*(.*)$")
 _NAME2KEY = {
     "画面比例": "ratio", "构图取景": "composition", "机位视角": "camera",
     "主体位置": "position", "姿态动作": "pose", "姿态": "pose",
     "对焦景深": "focus", "对焦": "focus", "色彩光影": "color", "色彩": "color",
 }
+# 长名优先，避免“色彩光影”被“色彩”抢走
+_NAME_ORDER = ["画面比例", "构图取景", "机位视角", "主体位置", "姿态动作",
+               "对焦景深", "色彩光影", "姿态", "对焦", "色彩"]
 
 DEFAULT_RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "output", "0907_sv")
+                                   "output", "0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1")
 DEFAULT_ENV_PATH = "/workspace/ai-camera-coach-app/backend/.env"
+
+# ★ 默认评审模型：直接改这两行（也可用 --model 临时覆盖）
+#   openai：gpt-5.5（最强）/ gpt-5.4（均衡，默认）/ gpt-5.4-mini（便宜快）/ gpt-4o-mini（最便宜）
+#   gemini：gemini-2.5-flash（REST，稳定）/ gemini-3.8-flash（interactions，长输出易截断）
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +137,8 @@ def split_sections(text: str):
 
 
 def parse_bullets(section: str) -> dict:
-    """把段内 “- 标签：正文”（可能跨行）解析成 {dim_key: 正文}。"""
+    """把段内 “- 标签：正文”（可能跨行）解析成 {dim_key: 正文}。
+    容错：标签可带 markdown 加粗（**画面比例**）、可带“整改”后缀、可带括号/英文别名。"""
     out: dict = {}
     if not section:
         return out
@@ -125,18 +147,20 @@ def parse_bullets(section: str) -> dict:
     for line in section.splitlines():
         if not line.strip():
             continue
-        if line.lstrip().startswith("-"):
-            bullets.append(line.lstrip()[1:].strip())
+        s = line.strip()
+        if s[0] in "-*•·":
+            bullets.append(s.lstrip("-*•· ").strip())
         elif bullets:
-            bullets[-1] += " " + line.strip()
+            bullets[-1] += " " + s
     for body in bullets:
-        m = re.match(_DIM_RE, body)
+        body = re.sub(r"[*_`]+", "", body).strip()      # 去掉 markdown 加粗/斜体
+        m = _LABEL_RE.match(body)
         if not m:
             continue
-        key = _NAME2KEY.get(m.group(1))
+        label, txt = m.group(1).strip(), m.group(2).strip()
+        key = next((_NAME2KEY[n] for n in _NAME_ORDER if n in label), None)
         if not key:
             continue
-        txt = m.group(2).strip()
         txt = re.sub(r"^[（(][^）)]*[）)]\s*", "", txt)   # 去掉“（仅使用本组证据）”
         if txt and (key not in out or len(txt) > len(out[key])):
             out[key] = txt
@@ -234,8 +258,13 @@ def call_gpt(key: str, model: str, messages: list[dict],
         "messages": messages,
         "response_format": {"type": "json_object"},
         "temperature": 0.0,
-        "max_tokens": 16000,
     }
+    # 新模型（gpt-5.x / o1/o3/o4 系列）不再接受 max_tokens，要改用 max_completion_tokens；
+    # temperature 也可能被拒（下面遇 400 会自动去掉重试）。
+    if model.startswith(("gpt-5", "o1", "o3", "o4")):
+        body["max_completion_tokens"] = 32000
+    else:
+        body["max_tokens"] = 16000
     last = None
     for attempt in range(retries + 1):
         retriable = False
@@ -244,20 +273,37 @@ def call_gpt(key: str, model: str, messages: list[dict],
                                             "Content-Type": "application/json"},
                               json=body, timeout=timeout, proxies=proxies)
             if r.status_code == 200:
-                txt = r.json()["choices"][0]["message"]["content"]
+                j = r.json()
+                txt = j["choices"][0]["message"]["content"] or ""
+                u = j.get("usage") or {}
+                if u:   # 便于观察 token 用量/成本
+                    print(f"[gpt] {model} tokens: in={u.get('prompt_tokens')} "
+                          f"out={u.get('completion_tokens')}", flush=True)
                 try:
                     return json.loads(txt)
                 except Exception as e:  # noqa: BLE001
-                    last = f"JSON 解析失败: {e} | 原始片段: {txt[:200]}"
-                    retriable = True    # JSON 解析失败重试一次更稳妥
+                    try:                       # 容忍 ```json 围栏
+                        return _parse_json_loose(txt)
+                    except Exception:  # noqa: BLE001
+                        last = f"JSON 解析失败: {e} | 原始片段: {txt[:200]}"
+                        retriable = True   # JSON 解析失败重试一次更稳妥
             else:
                 last = f"HTTP {r.status_code}: {r.text[:300]}"
                 low = r.text.lower()
                 # 鉴权/余额不足等业务错误不重试，直接抛出便于定位
                 if r.status_code in (401, 403) or ("credit" in low or "quota" in low):
                     raise RuntimeError(last)
-                # 仅 429 限流 / 5xx 视为瞬时错误
-                retriable = r.status_code in (429, 500, 502, 503, 504)
+                if r.status_code == 400 and "max_tokens" in low and "max_completion_tokens" in low:
+                    # 换成新参数名重试（gpt-5.x / o 系列）
+                    body.pop("max_tokens", None)
+                    body["max_completion_tokens"] = 32000
+                    retriable = True
+                elif r.status_code == 400 and "temperature" in low and "unsupported" in low:
+                    body.pop("temperature", None)
+                    retriable = True
+                else:
+                    # 仅 429 限流 / 5xx 视为瞬时错误
+                    retriable = r.status_code in (429, 500, 502, 503, 504)
         except RuntimeError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -272,12 +318,129 @@ def call_gpt(key: str, model: str, messages: list[dict],
 
 
 # ---------------------------------------------------------------------------
-# Gemini 调用（把 OpenAI 风格 messages 转成 Gemini generateContent）
+# Gemini 调用（gemini-3.x 走官方 SDK 的 interactions；其余走 REST generateContent）
 # ---------------------------------------------------------------------------
+def _parse_json_loose(txt: str) -> dict:
+    """容忍 ```json 围栏的 JSON 解析。"""
+    t = txt.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t).strip()
+    try:
+        return json.loads(t)
+    except Exception:  # noqa: BLE001
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+
+def _gemini_items(messages: list[dict]) -> list[dict]:
+    """OpenAI 风格 messages -> interactions 的 input 列表（text / image 混排）。"""
+    items: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            items.append({"type": "text", "text": str(msg.get("content", ""))})
+            continue
+        for item in msg.get("content", []):
+            if item.get("type") == "text":
+                items.append({"type": "text", "text": item["text"]})
+            elif item.get("type") == "image_url":
+                url = item["image_url"]["url"]
+                if url.startswith("data:image/") and ";base64," in url:
+                    mime, b64 = url[len("data:"):].split(";base64,", 1)
+                else:
+                    mime, b64 = "image/jpeg", url
+                items.append({"type": "image", "data": b64, "mime_type": mime})
+    return items
+
+
+def call_gemini_38(key: str, model: str, messages: list[dict],
+                   proxy: str | None = None,
+                   timeout: int = 300, retries: int = 3,
+                   max_output_tokens: int = 32768) -> dict:
+    """gemini-3.x（如 gemini-3.8-flash）：走官方 SDK 的 interactions 接口。
+
+    ⚠️ 实测 models.generate_content 对 gemini-3.8-flash 返回 503（high demand），必须用
+       client.interactions.create；需要 google-genai 包 + 本机代理。
+    ⚠️ 必须显式给 max_output_tokens：默认输出很短，7 维 JSON 会被截断成坏 JSON
+       （报 "Expecting ',' delimiter"）。response_format 让模型直接吐 JSON。
+    """
+    if proxy:
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            os.environ.setdefault(k, proxy)
+    try:
+        from google import genai
+    except ImportError as e:  # noqa: BLE001
+        raise RuntimeError("缺少 google-genai：请 pip install -U google-genai") from e
+
+    client = genai.Client(api_key=key)
+    items = _gemini_items(messages)
+    kwargs = {"model": model, "input": items,
+              # max_output_tokens 必须够大；thinking_level 调到 low（3.8-flash 只接受 medium/low/high，
+              # 写 minimal 会 400），否则思考 token 占满输出预算会让 JSON 被截断
+              "generation_config": {"max_output_tokens": max_output_tokens,
+                                    "thinking_level": "low"},
+              "response_format": {"type": "text", "mime_type": "application/json"}}
+    last = None
+    for attempt in range(retries + 1):
+        retriable = False
+        try:
+            resp = client.interactions.create(**kwargs)
+            txt = (getattr(resp, "output_text", "") or "").strip()
+            if not txt:
+                last = "空响应"
+                retriable = True
+            else:
+                try:
+                    return _parse_json_loose(txt)
+                except Exception as e:  # noqa: BLE001
+                    last = f"JSON 解析失败: {e} | 原始: {txt[:200]}"
+                    retriable = True
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            last = f"{type(e).__name__}: {msg[:300]}"
+            low = msg.lower()
+            if "429" in low or "quota" in low or "rate limit" in low:
+                # 免费层日额度（GenerateRequestsPerDayPerProjectPerModel-FreeTier = 20 次/项目/模型/天）
+                # 与分钟限流要分开：日额度耗尽时重试没意义，直接快速失败并提示。
+                if "perday" in low or "per day" in low or "perdayperprojectpermodel" in low:
+                    raise RuntimeError(last + "  （Gemini 免费层日额度：每个项目/模型 20 次/天，已用尽；"
+                                              "开通结算升为 paid tier 或等每天重置）")
+                m = re.search(r"retry in ([\d.]+)\s*s", msg)
+                wait = int(float(m.group(1))) + 2 if m else min(2 ** attempt * 5, 60)
+                if attempt < retries:
+                    print(f"[gemini] 触发限流，{wait}s 后重试 ({attempt + 1}/{retries + 1})")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(last + "  （Gemini 限流：可降 --concurrency 或换有额度的 key）")
+            if "400" in low and "response_format" in kwargs:
+                # 该模型/接口不接受 response_format 时自动去掉再试
+                kwargs.pop("response_format", None)
+                retriable = True
+            elif "400" in low and "thinking_level" in kwargs.get("generation_config", {}):
+                kwargs["generation_config"].pop("thinking_level", None)
+                retriable = True
+            elif any(t in low for t in ("api key not valid", "permission_denied",
+                                        "unauthenticated", "invalid api key")):
+                raise RuntimeError(last)
+            else:
+                retriable = True   # 代理/网络抖动（Server disconnected / 503 / timeout）都重试
+        if retriable and attempt < retries:
+            wait = 2 ** attempt * 3
+            print(f"[gemini] 请求失败(第{attempt + 1}/{retries + 1}次): {last}，{wait}s 后重试")
+            time.sleep(wait)
+            continue
+        raise RuntimeError(last or "Gemini 调用失败")
+
+
 def call_gemini(key: str, model: str, messages: list[dict],
                 proxy: str | None = None,
                 timeout: int = 180, retries: int = 2) -> dict:
-    """按 OpenAI 风格 messages -> Gemini REST 调用，返回解析后的 JSON dict。"""
+    """按 OpenAI 风格 messages -> Gemini；gemini-3.x 走 interactions，其余走 REST generateContent。"""
+    if model.startswith("gemini-3"):
+        return call_gemini_38(key, model, messages, proxy=proxy, timeout=timeout,
+                              retries=max(retries, 3))
     # 从 messages 提取 system / 文本 / 图片(base64)
     system = ""
     parts: list[dict] = []
@@ -301,8 +464,11 @@ def call_gemini(key: str, model: str, messages: list[dict],
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 32768,
             "responseMimeType": "application/json",
+            # ⚠️ 关掉思考（thinkingBudget=0）：思考 token 会占用 maxOutputTokens 预算，
+            #    导致 20~35 条判定的 JSON 被截断（报 Unterminated string），且慢十几倍。
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     if system:
@@ -325,9 +491,22 @@ def call_gemini(key: str, model: str, messages: list[dict],
             else:
                 err = r.json().get("error", {})
                 last = f"HTTP {r.status_code}: {err.get('message', r.text)[:300]}"
+                if r.status_code == 400 and "thinkingConfig" in body.get("generationConfig", {}):
+                    # 个别模型不支持 thinkingConfig 时自动去掉再试
+                    body["generationConfig"].pop("thinkingConfig", None)
+                    retriable = True
+                    continue
                 if r.status_code in (400, 401, 403):
                     raise RuntimeError(last)
-                retriable = r.status_code in (429, 500, 502, 503, 504)
+                if r.status_code == 429:
+                    low = r.text.lower()
+                    # 免费层日额度：GenerateRequestsPerDayPerProjectPerModel-FreeTier（20 次/项目/模型/天）
+                    if "perday" in low or "per day" in low:
+                        raise RuntimeError(last + "  （Gemini 免费层日额度：每个项目/模型 20 次/天，已用尽；"
+                                                  "开通结算升为 paid tier 或等每天重置）")
+                    retriable = True
+                else:
+                    retriable = r.status_code in (500, 502, 503, 504)
         except RuntimeError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -470,13 +649,16 @@ def main() -> None:
                     help="评估结果保存目录（默认 <results-dir>_gpt_eval）")
     ap.add_argument("--data-root", action="append", default=[],
                     help="输入原图缺失时的回退根目录（可多次）")
+    ap.add_argument("--input-image", "--input_image", dest="input_image", default=None,
+                    help="原图文件或其所在目录（可选）：solutions.json 里的 input_image 失效时用它兜底")
     ap.add_argument("--only", default=None, help="只处理含该关键字的图片文件夹")
     ap.add_argument("--limit", type=int, default=0, help="最多处理前 N 张图（0=全部）")
     ap.add_argument("--max-solutions", type=int, default=0, help="每张只取前 N 个方案（0=全部）")
     ap.add_argument("--provider", default="openai", choices=["openai", "gemini"],
-                    help="视觉评估后端：openai(gpt-4o-mini 默认) / gemini(gemini-2.5-flash)")
+                    help="视觉评估后端：openai(gpt-4o-mini 默认) / gemini(gemini-2.5-flash 或 gemini-3.8-flash)")
     ap.add_argument("--model", default=None,
-                    help="模型名（默认: openai->gpt-4o-mini, gemini->gemini-2.5-flash）")
+                    help="模型名（默认: openai->gpt-4o-mini, gemini->gemini-2.5-flash；"
+                         "openai 推荐 gpt-5.4 / gpt-5.5，或 gpt-5.4-mini 省钱；gemini-3.8-flash 走 interactions）")
     ap.add_argument("--env", default=DEFAULT_ENV_PATH, help="含 OPENAI_API_KEY 的 .env")
     ap.add_argument("--api-key", default=None, help="直接给 key（优先于 .env）")
     ap.add_argument("--proxy", default=None,
@@ -488,7 +670,7 @@ def main() -> None:
     args = ap.parse_args()
 
     key_var = "GEMINI_API_KEY" if args.provider == "gemini" else "OPENAI_API_KEY"
-    default_model = "gemini-2.5-flash" if args.provider == "gemini" else "gpt-4o-mini"
+    default_model = DEFAULT_GEMINI_MODEL if args.provider == "gemini" else DEFAULT_OPENAI_MODEL
     model = args.model or default_model
     key = get_api_key(args.env, args.api_key, var=key_var)
     if not key:
@@ -498,6 +680,12 @@ def main() -> None:
         or os.environ.get("HTTP_PROXY") or "http://127.0.0.1:30000"
     print(f"[gpt] 代理: {proxy} | provider={args.provider} | model={model}")
     roots = list(args.data_root)
+    fallback_img = None
+    if args.input_image:
+        if os.path.isfile(args.input_image):
+            fallback_img = args.input_image
+        elif os.path.isdir(args.input_image):
+            roots.insert(0, args.input_image)   # 目录：当作回退根（按文件名单层匹配）
     out_dir = args.out_dir or (args.results_dir.rstrip("/") + "_gpt_eval")
     raw_dir = os.path.join(out_dir, "raw")
     os.makedirs(raw_dir, exist_ok=True)
@@ -532,11 +720,14 @@ def main() -> None:
         with open(os.path.join(fd, "solutions.json"), "r", encoding="utf-8") as f:
             d = json.load(f)
         img_path = d.get("input_image", "")
-        # 回退根目录解析原图
+        # 回退：--input_image（文件）> --input_image 目录 / --data-root 根目录（按文件名单层/相对路径匹配）
         if img_path and not os.path.exists(img_path):
-            for root in roots:
-                cand = os.path.join(root, img_path.lstrip("/"))
-                if os.path.exists(cand):
+            base = os.path.basename(img_path)
+            cands = ([fallback_img] if fallback_img else []) + [
+                os.path.join(root, base) for root in roots
+            ] + [os.path.join(root, img_path.lstrip("/")) for root in roots]
+            for cand in cands:
+                if cand and os.path.exists(cand):
                     img_path = cand
                     break
         sols = [s for s in d.get("solutions", [])
@@ -559,6 +750,10 @@ def main() -> None:
         else:
             raw = call_gpt(key, model, messages, proxy=proxy)
         verdicts = normalize_verdicts(raw, len(sol_items))
+        expected = len(sol_items) * len(DIM_ORDER)
+        if len(verdicts) < expected:
+            print(f"[gpt] 注意: {name} 模型只返回 {len(verdicts)}/{expected} 条判定"
+                  f"（缺失的未计入统计）", flush=True)
         rec = {"image": name, "input_image": img_path, "raw": raw, "dims": verdicts}
         os.makedirs(os.path.join(raw_dir, name), exist_ok=True)
         with open(os.path.join(raw_dir, name, "verdicts.json"), "w", encoding="utf-8") as f:

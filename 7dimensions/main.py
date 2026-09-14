@@ -22,7 +22,7 @@ CLI 入口：统一调度「离线入库」与「推理生成（多方案 + 图�
   python main.py infer --input /path/to/user_photo.jpg --n-solutions 5
   python main.py infer --input /workspace/ai-camera-coach-app/backend/test_data/0715/dataset_link/jingxuan --max-images 0
   # 模式 3：检索 + 生成方案 + 图像编辑（追加 --image-edit；缺省时按 config.IMAGE_EDIT_ENABLED）
-  python main.py infer --input /path/to/user_photo.jpg --n-solutions 5 --image-edit
+  python main.py infer --input /workspace/ai-camera-coach-app/backend/test_data/0715/flower100_20 --max-images 0  --n-solutions 5 --image-edit
   # 整个文件夹（默认最多处理前 8 张，超出会被截断；--max-images 0 或单独 --max-images = 不限）
   python main.py infer --input /path/to/img_folder --max-images
   # 自定义：方案数上限 / 输出目录 / 生成 token 上限
@@ -80,6 +80,18 @@ from config import (FAISS_INDEX_DIR, FAISS_SQ8_DIR, GENERATE_MAX_NEW_TOKENS,  # 
 # 需要时在函数内 import，这样多进程并行时各 worker 能各自指定 GPU。
 
 
+def _apply_vlm_env(vlm: str | None, enable_thinking: bool | None) -> None:
+    """把 --vlm / --enable-thinking 写入环境变量，供 config.vlm_generator_model() 动态读取
+    （也保证 spawn 子进程能继承）。vlm 示例：qwen3.8-flash（DashScope 原生接口，可思考）。"""
+    if vlm:
+        os.environ["VLM_GENERATOR_MODEL"] = vlm
+    if enable_thinking is not None:
+        os.environ["VLM_ENABLE_THINKING"] = "1" if enable_thinking else "0"
+    if vlm or enable_thinking is not None:
+        print(f"[main] 生成VLM: {os.environ.get('VLM_GENERATOR_MODEL','<config默认>')} | "
+              f"enable_thinking={os.environ.get('VLM_ENABLE_THINKING','<auto>')}", flush=True)
+
+
 def _add_offline_args(p):
     p.add_argument("--limit", type=int, default=None, help="只处理前 N 条样本")
     p.add_argument("--start", type=int, default=0)
@@ -100,6 +112,10 @@ def _add_infer_args(p):
                    help="文件夹模式下最多处理多少张图（0 或不给数值 = 不限）")
     p.add_argument("--image-edit", action="store_true", default=None,
                    help="执行图像编辑（仅对生成命令生效；缺省时遵循 config.IMAGE_EDIT_ENABLED）")
+    p.add_argument("--vlm", default=None,
+                   help="生成VLM（provider/model 或直接写模型名），如 qwen3.8-flash；缺省用 config.VLM_GENERATOR_MODEL")
+    p.add_argument("--enable-thinking", action="store_true", default=None,
+                   help="开启思考模式（qwen38 缺省自动开启；此处可强制开启）")
 
 
 def main() -> None:
@@ -123,6 +139,8 @@ def main() -> None:
     p_srv.add_argument("--n-solutions", type=int, default=N_SOLUTIONS)
     p_srv.add_argument("--max-new-tokens", type=int, default=GENERATE_MAX_NEW_TOKENS)
     p_srv.add_argument("--output", type=str, default=OUTPUT_DIR)
+    p_srv.add_argument("--vlm", default=None, help="生成VLM，如 qwen3.8-flash")
+    p_srv.add_argument("--enable-thinking", action="store_true", default=None, help="开启思考模式")
 
     p_ret = sub.add_parser("retrieve", help="只做检索并输出 evidence 汇总 JSON")
     _add_infer_args(p_ret)
@@ -138,6 +156,8 @@ def main() -> None:
     p_all.add_argument("--n-solutions", type=int, default=N_SOLUTIONS)
     p_all.add_argument("--max-images", type=int, default=8, nargs="?", const=0,
                        help="文件夹模式最多处理多少张（0 或不给数值 = 不限）")
+    p_all.add_argument("--vlm", default=None, help="生成VLM，如 qwen3.8-flash")
+    p_all.add_argument("--enable-thinking", action="store_true", default=None, help="开启思考模式")
 
     args = parser.parse_args()
 
@@ -152,6 +172,7 @@ def main() -> None:
         return
 
     if args.cmd == "serve":
+        _apply_vlm_env(getattr(args, "vlm", None), getattr(args, "enable_thinking", None))
         from server import run_server
         run_server(port=args.port, host=args.host, n_solutions=args.n_solutions,
                    max_new_tokens=args.max_new_tokens, output=args.output)
@@ -168,39 +189,51 @@ def main() -> None:
         print("[main] 先执行离线入库 ...")
         offline_build(limit=args.limit, start=args.start, end=args.end, rebuild=args.rebuild,
                       faiss_part=args.faiss_part)
-        _do_infer(args.input, args.output, args.max_new_tokens, args.n_solutions, args.max_images)
+        _do_infer(args.input, args.output, args.max_new_tokens, args.n_solutions, args.max_images,
+                  vlm=args.vlm, enable_thinking=args.enable_thinking)
         return
 
     if args.cmd == "retrieve":
         _do_infer(args.input, args.output, args.max_new_tokens, args.n_solutions, args.max_images,
-                  generate_prompt=False, image_edit=None)
+                  generate_prompt=False, image_edit=None,
+                  vlm=args.vlm, enable_thinking=args.enable_thinking)
         return
 
     if args.cmd == "infer":
         _do_infer(args.input, args.output, args.max_new_tokens, args.n_solutions, args.max_images,
-                  generate_prompt=True, image_edit=args.image_edit)
+                  generate_prompt=True, image_edit=args.image_edit,
+                  vlm=args.vlm, enable_thinking=args.enable_thinking)
 
 
 def _infer_worker(gpu: int, paths: list, output: str, max_new_tokens: int, n_solutions: int,
-                 generate_prompt: bool = True, image_edit: bool | None = None) -> None:
+                 generate_prompt: bool = True, image_edit: bool | None = None,
+                 vlm: str | None = None) -> None:
     """多进程并行 worker：绑定一张卡，处理分配给它的图片子集（spawn 子进程）。
     image_edit=None 时由 config.IMAGE_EDIT_ENABLED 决定是否图编。"""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if vlm:
+        os.environ["VLM_GENERATOR_MODEL"] = vlm
     from user import run_inference
     for i, p in enumerate(paths):
         print(f"\n[main:{gpu}] 处理 {i + 1}/{len(paths)}: {p}", flush=True)
         try:
             _e, _s, js_path, edit_paths, _r = run_inference(
                 p, output_dir=output, max_new_tokens=max_new_tokens, n_solutions=n_solutions,
-                generate_prompt=generate_prompt, image_edit=image_edit,
+                generate_prompt=generate_prompt, image_edit=image_edit, vlm_model=vlm,
             )
             print(f"[main:{gpu}] 已保存: {js_path}（{len(edit_paths)} 张编辑图）", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[main:{gpu}] 处理失败 {p}: {exc}", flush=True)
 
+    # 批处理结束：等待后台异步图编全部完成，避免最后几张的编辑结果随进程退出丢失
+    from prompt import wait_pending_edits
+    print(f"[main:{gpu}] 全部图片处理完，等待后台图编完成 ...", flush=True)
+    wait_pending_edits()
+
 
 def _infer_parallel(paths: list, output: str, max_new_tokens: int, n_solutions: int, gpus: list,
-                   generate_prompt: bool = True, image_edit: bool | None = None) -> None:
+                   generate_prompt: bool = True, image_edit: bool | None = None,
+                   vlm: str | None = None) -> None:
     """多卡并行：把图片均分给 len(gpus) 个 spawn 进程，每进程绑定一张卡。"""
     import multiprocessing as mp
     ctx = mp.get_context("spawn")
@@ -211,7 +244,7 @@ def _infer_parallel(paths: list, output: str, max_new_tokens: int, n_solutions: 
             continue
         p = ctx.Process(target=_infer_worker, daemon=False,
                         args=(gpu, chunk, output, max_new_tokens, n_solutions,
-                              generate_prompt, image_edit))
+                              generate_prompt, image_edit, vlm))
         p.start()
         procs.append(p)
         print(f"[main] worker 启动: 卡{gpu} 处理 {len(chunk)} 张", flush=True)
@@ -220,7 +253,9 @@ def _infer_parallel(paths: list, output: str, max_new_tokens: int, n_solutions: 
 
 
 def _do_infer(input_path: str, output: str, max_new_tokens: int, n_solutions: int, max_images: int,
-              generate_prompt: bool = True, image_edit: bool | None = None) -> None:
+              generate_prompt: bool = True, image_edit: bool | None = None,
+              vlm: str | None = None, enable_thinking: bool | None = None) -> None:
+    _apply_vlm_env(vlm, enable_thinking)
     from user import resolve_input_paths
     paths = resolve_input_paths(input_path)
     if max_images and len(paths) > max_images:
@@ -230,7 +265,7 @@ def _do_infer(input_path: str, output: str, max_new_tokens: int, n_solutions: in
     if GPU_IDS and len(GPU_IDS) > 1 and len(paths) > 1:
         print(f"[main] 使用 {len(GPU_IDS)} 张卡并行: {GPU_IDS}")
         _infer_parallel(paths, output, max_new_tokens, n_solutions, GPU_IDS,
-                        generate_prompt=generate_prompt, image_edit=image_edit)
+                        generate_prompt=generate_prompt, image_edit=image_edit, vlm=vlm)
         return
 
     from user import run_inference
@@ -238,9 +273,14 @@ def _do_infer(input_path: str, output: str, max_new_tokens: int, n_solutions: in
         print(f"\n[main] 处理 {i + 1}/{len(paths)}: {p}")
         evidence, solutions, js_path, edit_paths, retr_s = run_inference(
             p, output_dir=output, max_new_tokens=max_new_tokens, n_solutions=n_solutions,
-            generate_prompt=generate_prompt, image_edit=image_edit,
+            generate_prompt=generate_prompt, image_edit=image_edit, vlm_model=vlm,
         )
         print(f"[main] 已保存: {js_path}（{len(edit_paths)} 张编辑图）")
+
+    # 批处理结束：等待后台异步图编完成（异步模式下 edit_paths 为空属正常，结果写入 solutions.json）
+    from prompt import wait_pending_edits
+    print("[main] 全部图片处理完，等待后台图编完成 ...", flush=True)
+    wait_pending_edits()
 
 
 if __name__ == "__main__":

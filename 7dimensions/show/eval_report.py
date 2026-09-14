@@ -8,7 +8,7 @@
 支持输出 PDF 与 PPTX（默认都出；可 --skip-pdf / --skip-pptx）。
 
 用法：
-  python eval_report.py --verdicts-dir output/0907_sv_qwen_eval/raw --out output/0907_sv_qwen_eval
+  python eval_report.py --verdicts-dir /workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval/raw --out /workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval
   python eval_report.py --verdicts-dir .../raw --only 0249a71 --skip-pptx   # 只出 1 张的 pdf
 """
 from __future__ import annotations
@@ -265,16 +265,34 @@ def _label_reason_para(e: dict, style) -> Paragraph:
 # PPTX
 # ---------------------------------------------------------------------------
 def render_pptx(items, out_path: str):
+    """每(图片,方案)一页；表格版式与 PDF 对齐：
+    列宽按比例分配、统一字号、按内容量估算行高(不高不矮且不超页)、
+    浅灰细边框 + 表头底色 + 斑马纹；判定标签作为独立 run 上色加粗。"""
     from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.dml.color import RGBColor
-    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
-    RGB = lambda h: RGBColor(int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
+
+    # ---- 与 PDF 对齐的表格版式参数 ----
+    RIGHT_W = 8.55                       # 表格总宽(inch)，与 PDF 右侧宽度一致
+    # 列宽：维度窄列 + 原文列宽(34%)、判定列窄(16%)，原文是长文本主源
+    COL_W = [0.62] + [(RIGHT_W - 0.62) * r for r in (0.34, 0.16, 0.34, 0.16)]
+    HEAD_SIZE, DIM_SIZE, BODY_SIZE = 9.5, 9.5, 8.5   # 表头/维度/正文 默认字号(pt)
+    TABLE_LEFT, TABLE_TOP = 4.5, 0.42
+    AVAIL_H = 7.5 - TABLE_TOP - 0.10     # 表格可用高度(inch)，底部只留 0.10 余量
+    # 字号档位：(表头, 维度, 正文, 表头行高, 数据行最小行高, 行距倍率)
+    # 行高按“含上下内边距”的宽松估算，宁高勿低，避免文字被裁；
+    # 整页放不下时逐档降字号，而不是压缩行高（否则又会截字）。
+    TIERS = [
+        (9.5, 9.5, 8.5, 0.38, 0.32, 1.45),
+        (9.0, 8.5, 7.5, 0.34, 0.26, 1.36),
+        (8.5, 8.0, 6.8, 0.30, 0.22, 1.28),
+    ]
+    HEAD_H, MIN_ROW, LEAD = TIERS[0][3], TIERS[0][4], TIERS[0][5]
 
     for it in items:
         name = it.get("image", "")
@@ -282,78 +300,244 @@ def render_pptx(items, out_path: str):
         sols = group_by_solution(it.get("dims", []))
         orig_sols = it.get("_orig", {}) or {}
         for sol, dims in sols.items():
-            slide = prs.slides.add_slide(blank)
-            # 左侧原图（统一转 PNG 字节流，兼容 .mpo 等非常规格式）
-            if img_path and os.path.exists(img_path):
-                stream, iw, ih = _image_stream(img_path)
-                r = min(3.9 / iw, 6.4 / ih)
-                w, h = Inches(iw * r), Inches(ih * r)
-                slide.shapes.add_picture(stream, Inches(0.25), Inches(0.6),
-                                         width=w, height=h)
-            tb = slide.shapes.add_textbox(Inches(0.25), Inches(0.1), Inches(4.0), Inches(0.4))
-            tb.text_frame.text = f"{name}  方案 {sol}"
-            tb.text_frame.paragraphs[0].font.size = Pt(14)
-            tb.text_frame.paragraphs[0].font.bold = True
-            # 右侧表格：维度 | 原·缺陷分析 | 分析判定 | 原·整改建议 | 建议判定
             od = orig_sols.get(sol, {})
-            nrows = len(dims) + 1
-            gt = slide.shapes.add_table(nrows, 5, Inches(4.5), Inches(0.35),
-                                        Inches(8.55), Inches(6.9)).table
-            for c, htxt in enumerate(["维度", "原·缺陷分析", "分析判定",
-                                      "原·整改建议", "建议判定"]):
-                gt.cell(0, c).text = htxt
-            for i, dim in enumerate(DIM_ORDER):
+            # 行数据：(维度, 原·缺陷分析, (label,reason)分析判定, 原·整改建议, (label,reason)建议判定)
+            rows = []
+            for dim in DIM_ORDER:
                 if dim not in dims:
                     continue
                 e = dims[dim]
                 o = od.get(dim) or {}
-                gt.cell(i + 1, 0).text = DIM_CN[dim]
-                orig_an = (o.get("analysis") or "").strip() or "（未提供）"
-                orig_ad = (o.get("advice") or "").strip() or "（未提供）"
-                gt.cell(i + 1, 1).text = orig_an
-                gt.cell(i + 1, 3).text = orig_ad
-                for c, key in ((2, "analysis"), (4, "advice")):
-                    ev = e[key]
-                    label = (ev.get("label") or "null")
-                    label = label if label in LABEL_CN else "null"
-                    reason = (ev.get("reason") or "").strip() or "（无理由）"
-                    gt.cell(i + 1, c).text = f"[{LABEL_CN[label]}] {reason}"
-            # 样式
-            for row in gt.rows:
-                row.height = Inches(6.9 / (len(dims) + 1))
-            for ri in range(nrows):
-                for ci in range(3):
-                    cell = gt.cell(ri, ci)
-                    for para in cell.text_frame.paragraphs:
-                        para.font.size = Pt(9 if ci == 0 else 8)
-                        if ci == 0:
-                            para.alignment = PP_ALIGN.CENTER
-                            para.font.bold = True
-                    if ri == 0:
-                        cell.fill.solid()
-                        cell.fill.fore_color.rgb = RGB("#eef1f7")
-            # 给 label 上色（简单处理：第2/3列首个 [正确/部分正确/错误] 着色）
-            _color_labels(gt)
+                rows.append((
+                    DIM_CN[dim],
+                    (o.get("analysis") or "").strip() or "（未提供）",
+                    _split_label_reason(e.get("analysis")),
+                    (o.get("advice") or "").strip() or "（未提供）",
+                    _split_label_reason(e.get("advice")),
+                ))
+            nrows = len(rows) + 1
+
+            # 文本矩阵（用于估行高）
+            texts = [["维度", "原·缺陷分析", "分析判定", "原·整改建议", "建议判定"]]
+            texts += [[d, oa, ana[1], oad, adv[1]]
+                      for (d, oa, ana, oad, adv) in rows]
+            # 逐档尝试字号：让 估高字号 == 渲染字号，保证行高足以完整放下全部文字
+            head_pt = dim_pt = body_pt = None
+            for (h_pt, d_pt, b_pt, hh, mr, ld) in TIERS:
+                sizes = [d_pt, b_pt, b_pt, b_pt, b_pt]
+                row_h = _pptx_row_heights(texts, COL_W, sizes, hh, mr, ld)
+                total_h = sum(row_h)
+                if total_h <= AVAIL_H + 1e-6:
+                    head_pt, dim_pt, body_pt = h_pt, d_pt, b_pt
+                    break
+            else:        # 最小档仍超高：等比压缩兜底（极少数超长页）
+                h_pt, d_pt, b_pt, hh, mr, ld = TIERS[-1]
+                head_pt, dim_pt, body_pt = h_pt, d_pt, b_pt
+                sizes = [d_pt, b_pt, b_pt, b_pt, b_pt]
+                row_h = _pptx_row_heights(texts, COL_W, sizes, hh, mr, ld)
+                total_h = sum(row_h)
+                print(f"[report] warn {name} 方案{sol}: 最小档字号仍估算 "
+                      f"{total_h:.2f}in > 可用 {AVAIL_H:.2f}in，等比压缩兜底")
+                k = AVAIL_H / total_h
+                row_h = [h * k for h in row_h]
+                total_h = AVAIL_H
+
+            slide = prs.slides.add_slide(blank)
+            # 左侧原图（统一转 JPEG 字节流，兼容 .mpo 等非常规格式）
+            if img_path and os.path.exists(img_path):
+                stream, iw, ih = _image_stream(img_path)
+                r = min(3.9 / iw, 6.4 / ih)
+                slide.shapes.add_picture(stream, Inches(0.25), Inches(0.6),
+                                         width=Inches(iw * r), height=Inches(ih * r))
+            # 标题
+            tb = slide.shapes.add_textbox(Inches(0.25), Inches(0.06),
+                                          Inches(4.05), Inches(0.5))
+            _pptx_fill_paras(tb.text_frame,
+                             [[(f"{name}   方案 {sol}",
+                                dict(size=15, bold=True, color="1f3864"))]])
+
+            # 右侧表格框架：先建最小高度，随后逐行设高
+            gf = slide.shapes.add_table(nrows, 5, Inches(TABLE_LEFT),
+                                        Inches(TABLE_TOP), Inches(RIGHT_W),
+                                        Inches(min(total_h, AVAIL_H)))
+            tbl = gf.table
+            # 关闭默认 Office 首行高亮/斑马，改用自绘的浅色样式
+            tblPr = tbl._tbl.tblPr
+            tblPr.set("firstRow", "0")
+            tblPr.set("bandRow", "0")
+            for c, w in enumerate(COL_W):
+                tbl.columns[c].width = Inches(w)
+            for r, h in enumerate(row_h):
+                tbl.rows[r].height = Inches(h)
+
+            # 表头
+            for c, htxt in enumerate(["维度", "原·缺陷分析", "分析判定",
+                                      "原·整改建议", "建议判定"]):
+                cell = tbl.cell(0, c)
+                _pptx_style_cell(cell, fill="eef1f7")
+                _pptx_fill_paras(cell.text_frame,
+                                 [[(htxt, dict(size=head_pt, bold=True,
+                                               color="1f3864"))]],
+                                 align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+            # 数据行：斑马纹底色，标签列做成 [label]+reason 两个 run
+            for i, (d, oa, ana, oad, adv) in enumerate(rows, start=1):
+                bg = "ffffff" if i % 2 else "f8f9fa"
+                _pptx_style_cell(tbl.cell(i, 0), fill=bg)
+                _pptx_fill_paras(tbl.cell(i, 0).text_frame,
+                                 [[(d, dict(size=dim_pt, bold=True,
+                                            color="1f3864"))]],
+                                 align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+                for c, txt in ((1, oa), (2, ana), (3, oad), (4, adv)):
+                    cell = tbl.cell(i, c)
+                    _pptx_style_cell(cell, fill=bg)
+                    if c in (2, 4):
+                        lab, reason = txt
+                        paras = [[
+                            (f"[{LABEL_CN[lab]}] ",
+                             dict(size=body_pt, bold=True, color=LABEL_COLOR[lab])),
+                            (reason, dict(size=body_pt, color="24292f")),
+                        ]]
+                    else:
+                        paras = [[(txt, dict(size=body_pt, color="24292f"))]]
+                    _pptx_fill_paras(cell.text_frame, paras,
+                                     align=PP_ALIGN.LEFT, anchor=MSO_ANCHOR.TOP)
+            # 最后统一画浅灰细边框（覆盖默认样式影响）
+            for r in range(nrows):
+                for c in range(5):
+                    _pptx_border_cell(tbl.cell(r, c))
     prs.save(out_path)
     print(f"[report] PPTX: {out_path}")
 
 
-def _color_labels(table):
-    """只给判定列(2=分析判定,4=建议判定)的 [正确/部分正确/错误/未提供] 前缀着色。"""
+# ---------------------------------------------------------------------------
+# PPTX 排版辅助（与 PDF 版式对齐）
+# ---------------------------------------------------------------------------
+FONT_CN = "Microsoft YaHei"
+
+
+def _split_label_reason(e: dict):
+    """analysis/advice dict -> (label, reason)，统一缺省值。"""
+    if not e:
+        return "null", "（无理由）"
+    label = e.get("label") or "null"
+    label = label if label in LABEL_CN else "null"
+    reason = (e.get("reason") or "").strip() or "（无理由）"
+    return label, reason
+
+
+def _pptx_est_lines(text: str, width_in: float, font_pt: float) -> int:
+    """估算文本在 列宽×字号 下占几行：全角≈1em，半角≈0.55em（偏保守）。"""
+    import math
+    usable_pt = max(0.1, width_in - 0.14) * 72.0
+    ems_per_line = max(1.0, usable_pt / font_pt)
+    lines = 0
+    for seg in str(text).split("\n"):
+        ems = sum(1.0 if ord(ch) > 0x2E7F else 0.55 for ch in seg)
+        lines += max(1, math.ceil(ems / ems_per_line))
+    return lines
+
+
+def _pptx_row_heights(texts, col_w, sizes, head_h, min_row, lead):
+    """按每格文本量估算各行高(inch)。每行高度 = 文字所需 + 上下内边距(PAD)，宁高勿低。"""
+    pad = 0.06                       # 单元格上下内边距(0.04) + 安全余量
+    row_h = [head_h + pad]
+    for r in range(1, len(texts)):
+        h = min_row
+        for c, txt in enumerate(texts[r]):
+            n_lines = _pptx_est_lines(txt, col_w[c], sizes[c])
+            h = max(h, n_lines * sizes[c] * lead / 72.0)
+        row_h.append(h + pad)
+    return row_h
+
+
+def _pptx_style_run(run, sty: dict):
+    """统一 run 的字号/粗细/颜色/中英文字体，避免不同机器字形与默认 18pt 不一致。"""
+    from pptx.util import Pt
     from pptx.dml.color import RGBColor
-    for ri in range(1, len(table.rows)):
-        for ci in (2, 4):
-            cell = table.cell(ri, ci)
-            for para in cell.text_frame.paragraphs:
-                for run in para.runs:
-                    for lab, cn in LABEL_CN.items():
-                        if f"[{cn}]" in run.text:
-                            run.font.color.rgb = RGBColor(*_hex(LABEL_COLOR[lab]))
-                            break
+    from pptx.oxml.ns import qn
+    f = run.font
+    f.size = Pt(sty.get("size", 9))
+    f.bold = bool(sty.get("bold", False))
+    f.name = FONT_CN                        # 会生成 a:latin
+    f.color.rgb = RGBColor(*_hex(sty.get("color", "24292f")))
+    rPr = run._r.get_or_add_rPr()
+    latin = rPr.find(qn("a:latin"))
+    ea = rPr.find(qn("a:ea"))
+    cs = rPr.find(qn("a:cs"))
+    if latin is not None:
+        if ea is None:
+            ea = latin.makeelement(qn("a:ea"), {"typeface": FONT_CN})
+            latin.addnext(ea)
+        else:
+            ea.set("typeface", FONT_CN)
+        anchor = ea if ea is not None else latin
+        if cs is None:
+            cs = anchor.makeelement(qn("a:cs"), {"typeface": FONT_CN})
+            anchor.addnext(cs)
+        else:
+            cs.set("typeface", FONT_CN)
+
+
+def _pptx_fill_paras(tf, paras, align=None, anchor=None):
+    """填充 text_frame。paras = [[(text, style_dict), ...], ...]（每段可多 run）。"""
+    from pptx.enum.text import MSO_ANCHOR
+    tf.word_wrap = True
+    if anchor is not None:
+        tf.vertical_anchor = anchor
+    tf.clear()
+    for idx, runs in enumerate(paras):
+        p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
+        if align is not None:
+            p.alignment = align
+        p.line_spacing = 1.0
+        for text, sty in runs:
+            run = p.add_run()
+            run.text = text
+            _pptx_style_run(run, sty)
+
+
+def _pptx_style_cell(cell, fill: str):
+    """单元格底色与内边距（显式填充以盖掉默认表格样式）。"""
+    from pptx.util import Inches
+    from pptx.dml.color import RGBColor
+    cell.fill.solid()
+    cell.fill.fore_color.rgb = RGBColor(*_hex(fill))
+    cell.margin_left = Inches(0.05)
+    cell.margin_right = Inches(0.05)
+    cell.margin_top = Inches(0.02)
+    cell.margin_bottom = Inches(0.02)
+
+
+def _pptx_border_cell(cell, color="d0d7de", width_emu=9525):
+    """给单元格四边画 0.75pt 细边框；按 OOXML 顺序插到填充之前。"""
+    from pptx.oxml.ns import qn
+    tcPr = cell._tc.get_or_add_tcPr()
+    tags = [qn("a:lnL"), qn("a:lnR"), qn("a:lnT"), qn("a:lnB")]
+    for tag in tags:
+        for old in tcPr.findall(tag):
+            tcPr.remove(old)
+    first = None
+    for child in tcPr:
+        if child.tag not in tags:
+            first = child
+            break
+    for tag in tags:
+        ln = tcPr.makeelement(tag, {"w": str(width_emu), "cap": "flat",
+                                    "cmpd": "sng", "algn": "ctr"})
+        fill_el = ln.makeelement(qn("a:solidFill"), {})
+        clr = fill_el.makeelement(qn("a:srgbClr"), {"val": color})
+        fill_el.append(clr)
+        ln.append(fill_el)
+        if first is not None:
+            first.addprevious(ln)
+        else:
+            tcPr.append(ln)
 
 
 def _hex(h):
-    return int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+    """'#rrggbb' 或 'rrggbb' -> (r, g, b) 字节。兼容带/不带 # 的写法。"""
+    h = h.lstrip("#").strip()
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ DashScope 原生接口直连（无需 SDK/代理），key 读 backend/.env 的 Q
 用法示例：
   python evaluate_qwen.py --limit 10            # DashScope qwen3.8-max，先评前 10 个文件夹
   python evaluate_qwen.py                        # 全量评 output/0907_sv
-  python evaluate_qwen.py --results-dir output/0907_sv_FIRST_GOOD_PER_POOR
+  python evaluate_qwen.py --results-dir /workspace/ai-ddge/7dimensions/output/0909_no_rag --out-dir /workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval
   python evaluate_qwen.py --max-solutions 2      # 每张只取前 2 个方案
   python evaluate_qwen.py --provider gemini --model gemini-2.5-flash
   python evaluate_qwen.py --provider openai --model gpt-4o
@@ -399,7 +399,9 @@ def call_qwen(key: str, model: str, messages: list[dict],
             {"image": image_url},
             {"text": full_text},
         ]}]},
-        "parameters": {"result_format": "message"},
+        # max_tokens 必须给足：默认输出较短，5方案×7维JSON会被硬截断成坏JSON
+        "parameters": {"result_format": "message", "temperature": 0.0,
+                       "max_tokens": 8192},
     }
     last = None
     for attempt in range(retries + 1):
@@ -581,14 +583,21 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="忽略缓存强制重评")
     args = ap.parse_args()
 
-    key_var = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY",
-               "qwen": "QWEN_API_KEY"}[args.provider]
+    var_chain = {"openai": ["OPENAI_API_KEY"],
+                 "gemini": ["GEMINI_API_KEY"],
+                 "qwen": ["QWEN_API_KEY_2", "QWEN_API_KEY"]}[args.provider]
     default_model = {"openai": "gpt-4o-mini", "gemini": "gemini-2.5-flash",
                      "qwen": "qwen3.8-max"}[args.provider]
     model = args.model or default_model
-    key = get_api_key(args.env, args.api_key, var=key_var)
+    key = args.api_key or ""
+    key_var = ""
+    for v in var_chain:                       # qwen: 优先 QWEN_API_KEY_2（有余额），再退 QWEN_API_KEY
+        k = get_api_key(args.env, None, var=v)
+        if k:
+            key, key_var = k, v
+            break
     if not key:
-        sys.exit(f"[qwen] 未找到 {key_var}（backend/.env 或 --api-key）")
+        sys.exit(f"[qwen] 未找到 {'/'.join(var_chain)}（backend/.env 或 --api-key）")
 
     proxy = None
     if args.provider in ("openai", "gemini"):

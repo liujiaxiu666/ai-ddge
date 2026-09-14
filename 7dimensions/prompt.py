@@ -36,18 +36,13 @@ import sys
 import time
 
 import requests
-import torch
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import queue
-import threading
-
-from concurrent.futures import Future
-
-from transformers import TextIteratorStreamer
-
+# ⚠️ 必须在 import torch / transformers 之前导入 config + encoder：encoder 在 import torch 前
+#    锁定 CUDA_DEVICE_ORDER=PCI_BUS_ID 与 CUDA_VISIBLE_DEVICES（详见 encoder.py 开头注释）；
+#    否则 transformers 导入时就会初始化 CUDA，.env 里的选卡会失效。
 from config import (DIM_CN, DIM_ORDER, DTYPE,                            # noqa: E402
                     GEN_TEMPERATURE, GENERATE_MAX_NEW_TOKENS,
                     GENERATE_PARALLEL,
@@ -55,12 +50,22 @@ from config import (DIM_CN, DIM_ORDER, DTYPE,                            # noqa:
                     IMAGE_EDIT_PARALLEL, IMAGE_EDIT_PROMPT_SECTION,
                     INCLUDE_DIM_GOOD_IMAGE,
                     MAX_SOLUTIONS, N_SOLUTIONS, OUTPUT_DIR,
-                    QWEN_API_KEY, QWEN_API_KEYS_CONCURRENCY, QWEN_BASE_URL,
+                    QWEN_API_KEYS_CONCURRENCY, QWEN_BASE_URL,
+                    QWEN38_API_URL,
                     VLM_API_MAX_RETRIES,
-                    parse_model_spec, resolve_local_model,
+                    parse_model_spec, qwen_api_key, resolve_local_model,
+                    vlm_enable_thinking, vlm_generator_model,
                     VLLM_BASE_URL, VLM_GENERATOR_MODEL, VLM_MODEL_NAME,
                     VLM_PROVIDER)
 from encoder import get_shared_vlm                                       # noqa: E402
+
+import queue
+import threading
+
+from concurrent.futures import Future
+
+import torch
+from transformers import TextIteratorStreamer
 
 
 def _pil_to_b64(img) -> str:
@@ -172,6 +177,29 @@ _pool_lock = threading.Lock()
 _pool_singleton: QwenApiPool | None = None
 
 
+# ---------------------------------------------------------------------------
+# 后台图编线程登记（image_edit_async=True 时使用）
+# 批处理/进程退出前调用 wait_pending_edits()，避免最后几张图的编辑结果随进程退出丢失。
+# ---------------------------------------------------------------------------
+_PENDING_EDITS: set = set()
+_PENDING_LOCK = threading.Lock()
+
+
+def wait_pending_edits(timeout: float | None = None) -> None:
+    """等待所有后台图编线程结束（timeout=None 表示一直等到全部完成）。"""
+    deadline = None if timeout is None else time.time() + timeout
+    while True:
+        with _PENDING_LOCK:
+            threads = [t for t in _PENDING_EDITS if t.is_alive()]
+        if not threads:
+            return
+        for th in threads:
+            remain = None if deadline is None else max(0.0, deadline - time.time())
+            th.join(remain)
+        if deadline is not None and time.time() >= deadline:
+            return
+
+
 def get_qwen_api_pool() -> QwenApiPool:
     """全局单例：多图 / 常驻服务共享同一批工作线程（避免每图重建线程）。"""
     global _pool_singleton
@@ -185,19 +213,27 @@ def get_qwen_api_pool() -> QwenApiPool:
 class GuidanceGenerator:
     """基于 qwen3-vl-8b-instruct 生成拍照指导（与编码器共用同一份权重）。"""
 
-    def __init__(self, model_spec: str = VLM_GENERATOR_MODEL, dtype: str = DTYPE):
-        """provider: qwen(远程API) / vllm(本地vLLM) / local(本地transformers)。"""
-        if model_spec == VLM_GENERATOR_MODEL:
-            provider, name = VLM_PROVIDER, VLM_MODEL_NAME
-        else:
-            # 统一走 config 解析：支持绝对路径 / local/ 前缀 / provider/model 三种写法
-            provider, name = parse_model_spec(model_spec)
+    def __init__(self, model_spec: str | None = None, dtype: str = DTYPE):
+        """provider: qwen(远程兼容接口) / qwen38(DashScope 原生多模态,可思考) / vllm(本地vLLM) / local(本地transformers)。
+        model_spec 为 None 时用 config.vlm_generator_model()（动态读环境变量）。
+        生成模型可直写模型名，如 'qwen3.8-flash'。"""
+        if model_spec is None:
+            model_spec = vlm_generator_model()
+        provider, name = parse_model_spec(model_spec)
         self.provider, self.model_spec = provider, model_spec
         self.device = None
         self.model = self.processor = None
         self.api_base_url = self.api_model = self.api_key = None
+        self.enable_thinking = False
         if provider in ("qwen", "api"):
-            self.api_base_url, self.api_model, self.api_key = QWEN_BASE_URL, name, QWEN_API_KEY
+            self.api_base_url, self.api_model, self.api_key = QWEN_BASE_URL, name, qwen_api_key()
+        elif provider in ("qwen38", "qwen3.8", "qwen-responses", "responses"):
+            # qwen3.8-flash：DashScope 原生多模态接口；优先用有余额的 QWEN_API_KEY_2
+            self.provider = "qwen38"
+            self.api_base_url = QWEN38_API_URL
+            self.api_model = name
+            self.api_key = qwen_api_key()
+            self.enable_thinking = vlm_enable_thinking()
         elif provider in ("vllm", "vllm-local"):
             self.api_base_url, self.api_model, self.api_key = VLLM_BASE_URL, name, ""
         else:  # local
@@ -268,6 +304,9 @@ class GuidanceGenerator:
     @torch.no_grad()
     def generate_stream(self, messages, max_new_tokens: int = GENERATE_MAX_NEW_TOKENS,
                         temperature: float = GEN_TEMPERATURE, api_key: str | None = None):
+        if self.provider == "qwen38":
+            yield from self._qwen38_stream(messages, max_new_tokens, temperature)
+            return
         if self.provider in ("qwen", "api", "vllm", "vllm-local"):
             yield from self._api_stream(messages, max_new_tokens, temperature, api_key=api_key)
             return
@@ -293,6 +332,58 @@ class GuidanceGenerator:
         threading.Thread(target=_run, daemon=True).start()
         for chunk in streamer:
             yield chunk
+
+    # ------------------------------------------------------------------
+    # qwen3.8-flash：DashScope 原生多模态接口（直连，无需 SDK / 代理）
+    #   POST https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+    #   body: {model, input:{messages:[{role,content:[{image:dataurl},{text:...}]}]},
+    #          parameters:{result_format:"message", temperature, max_tokens, [enable_thinking]}}
+    #   ⚠️ max_tokens 必须给足，否则长输出会被硬截断（这里直接用 max_new_tokens）。
+    # ------------------------------------------------------------------
+    def _qwen38_stream(self, messages, max_new_tokens: int, temperature: float):
+        images, texts = [], []
+        for msg in messages:
+            for item in msg.get("content", []):
+                if item.get("type") == "text":
+                    texts.append(item.get("text", ""))
+                elif item.get("type") == "image":
+                    images.append({"image": _pil_to_b64(item["image"])})
+        content = images + [{"text": t} for t in texts if t]
+        params = {"result_format": "message", "temperature": temperature,
+                  "max_tokens": max_new_tokens}
+        if getattr(self, "enable_thinking", False):
+            params["enable_thinking"] = True
+        body = {"model": self.api_model,
+                "input": {"messages": [{"role": "user", "content": content}]},
+                "parameters": params}
+
+        last = None
+        for attempt in range(VLM_API_MAX_RETRIES + 1):
+            r = requests.post(self.api_base_url,
+                              headers={"Authorization": f"Bearer {self.api_key}",
+                                       "Content-Type": "application/json"},
+                              json=body, timeout=600)
+            if r.status_code == 200:
+                j = r.json()
+                try:
+                    parts = j["output"]["choices"][0]["message"]["content"]
+                    txt = "".join(c.get("text", "") for c in parts if isinstance(c, dict))
+                except Exception:  # noqa: BLE001
+                    txt = ""
+                if not txt:
+                    raise RuntimeError(f"qwen3.8 返回为空: {str(j)[:300]}")
+                yield txt
+                return
+            last = f"HTTP {r.status_code}: {r.text[:300]}"
+            if r.status_code in (400, 401, 403):
+                raise RuntimeError(last)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < VLM_API_MAX_RETRIES:
+                wait = min(2 ** attempt * 2, 30)
+                print(f"[qwen38] 请求失败(第{attempt + 1}/{VLM_API_MAX_RETRIES + 1}次): {last}，{wait}s 后重试",
+                      flush=True)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(last or "qwen3.8 调用失败")
 
     # ------------------------------------------------------------------
     # 远程 DashScope qwen：OpenAI 兼容接口流式调用（requests 直连，无 SDK 依赖）
@@ -402,13 +493,21 @@ class GuidanceGenerator:
                 if k - 1 < len(evs) and evs[k - 1].get("good_image_path"):
                     reference_images[dim] = evs[k - 1]["good_image_path"]
             messages = self.build_solution_messages(user_img, evidence_by_dim, k, n)
+            # 时间戳日志：多份并发时若各份几乎同时开始 = 真并发；若开始时间逐个错开
+            # （如 +0s / +110s / +220s ...）= 被 API 限流排队退化成串行。t 为相对本阶段起点秒数。
+            t_k0 = time.time()
+            print(f"[prompt] 方案 {k}/{n} 开始生成 (t=+{t_k0 - t_vlm0:.1f}s)", flush=True)
             chunks = list(self.generate_stream(messages, max_new_tokens=max_new_tokens,
                                                temperature=temperature, api_key=api_key))
+            dt_k = time.time() - t_k0
+            print(f"[prompt] 方案 {k}/{n} 生成完成 (t=+{time.time() - t_vlm0:.1f}s, "
+                  f"本份耗时 {dt_k:.1f}s)", flush=True)
             return k, {"index": k, "direction": label, "text": "".join(chunks).strip(),
                        "reference_images": reference_images}
 
         def _collect(k, sol):
-            print(f"\n[prompt] ==== 方案 {k}/{n}（{sol['direction']}）完成 ====")
+            print(f"\n[prompt] ==== 方案 {k}/{n}（{sol['direction']}）完成 "
+                  f"(t=+{time.time() - t_vlm0:.1f}s) ====")
             print(sol["text"])
             solutions[k - 1] = sol
 
@@ -444,7 +543,8 @@ class GuidanceGenerator:
                     _record_failure(1, e)
                 else:
                     _collect(1, sol)
-        elif GENERATE_PARALLEL and n > 1:
+        elif (GENERATE_PARALLEL or self.provider == "qwen38") and n > 1:
+            # qwen38（远程 DashScope）并发调用更快：n 个方案同时发请求（远程 API 无显存争用）
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=n) as ex:
                 futs = {ex.submit(_build_solution, None, k): k for k in range(1, n + 1)}
@@ -522,8 +622,19 @@ class GuidanceGenerator:
                 return paths, elapsed
 
             if image_edit_async:
-                import threading
-                threading.Thread(target=_do_edit, daemon=True).start()
+                # 后台异步图编：登记到全局待完成集合，便于批处理/进程退出前
+                # wait_pending_edits() 等待，避免最后几张图的编辑结果丢失。
+                def _run_edit_bg():
+                    try:
+                        _do_edit()
+                    finally:
+                        with _PENDING_LOCK:
+                            _PENDING_EDITS.discard(threading.current_thread())
+
+                _th = threading.Thread(target=_run_edit_bg, daemon=True)
+                with _PENDING_LOCK:
+                    _PENDING_EDITS.add(_th)
+                _th.start()
                 print("[prompt] 图编已提交后台异步（响应不等待图编）", flush=True)
             else:
                 edit_paths, edit_s = _do_edit()

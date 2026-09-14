@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import sys
+import threading
 import time
 
 from PIL import Image
@@ -34,13 +35,45 @@ from aesrecon import (build_basename_index, build_variant_map,        # noqa: E4
                       lookup_variants)
 from config import (AGG_POOL_TOPK, DEVICE, DIM_ORDER, DTYPE,          # noqa: E402
                     ENCODER_MODEL_PATH, EVIDENCE_FIRST_GOOD_PER_POOR, GENERATE_MAX_NEW_TOKENS,
-                    MAX_DIM_EVIDENCE, MIN_SOLUTIONS, N_SOLUTIONS, OUTPUT_DIR,
-                    RETRIEVAL_PARALLEL, VARIANTS_PER_DIM_POOR)
+                    IMAGE_EDIT_ASYNC, IMAGE_EDIT_ENABLED, MAX_DIM_EVIDENCE, MIN_SOLUTIONS,
+                    N_SOLUTIONS, OUTPUT_DIR, RETRIEVAL_PARALLEL, VARIANTS_PER_DIM_POOR)
 from encoder import DdgeEncoder                                      # noqa: E402
 from faiss_index import FaissIndex                                   # noqa: E402
 from prompt import GuidanceGenerator                                 # noqa: E402
 
 IMAGE_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
+
+# ---------------------------------------------------------------------------
+# 进程级单例：FAISS 索引 + 坏图（控制的）变体表
+#   - FAISS：每维 3.1GB，read_index 约 2s/维，7 维 ~17s；
+#   - 变体表：13MB metadata.jsonl，每图重建要重读+正则解析；
+# 二者加载代价极高，必须在进程内复用，否则批量 N 张图要重复付 N 次。
+# 多进程（多卡 spawn）时每个 worker 进程各自加载一次，属预期。
+# ---------------------------------------------------------------------------
+_FAISS_CLIENT = None
+_VARIANT_CACHE = None
+_SINGLETON_LOCK = threading.Lock()
+
+
+def get_faiss_client() -> FaissIndex:
+    """进程级复用同一个 FaissIndex（7 维索引懒加载，只加载一次）。"""
+    global _FAISS_CLIENT
+    if _FAISS_CLIENT is None:
+        with _SINGLETON_LOCK:
+            if _FAISS_CLIENT is None:
+                _FAISS_CLIENT = FaissIndex()
+    return _FAISS_CLIENT
+
+
+def get_variant_maps():
+    """进程级缓存 (variant_map, basename_index)，避免每张图重读 13MB metadata.jsonl。"""
+    global _VARIANT_CACHE
+    if _VARIANT_CACHE is None:
+        with _SINGLETON_LOCK:
+            if _VARIANT_CACHE is None:
+                vmap = build_variant_map()
+                _VARIANT_CACHE = (vmap, build_basename_index(vmap))
+    return _VARIANT_CACHE
 
 
 def resolve_input_paths(input_arg: str) -> list:
@@ -143,7 +176,8 @@ def run_inference(user_img_path: str,
                   max_new_tokens: int = GENERATE_MAX_NEW_TOKENS,
                   n_solutions: int = N_SOLUTIONS,
                   generate_prompt: bool = True,
-                  image_edit: bool | None = None):
+                  image_edit: bool | None = None,
+                  vlm_model: str | None = None):
     """单张用户图片 -> 7 套查询 patch -> 每维独立检索+坏图变体展开 -> 可选生成 prompt / 可选图像编辑。
     generate_prompt=False 时为「只检索」模式（输出 retrieval_summary.json）；
     image_edit=None 时按 config.IMAGE_EDIT_ENABLED 决定是否图编，True 则强制图编。
@@ -153,10 +187,9 @@ def run_inference(user_img_path: str,
     user_img = Image.open(user_img_path).convert("RGB")
 
     encoder = DdgeEncoder(model_path=ENCODER_MODEL_PATH, dtype=DTYPE, device=DEVICE)
-    client = FaissIndex()              # 每维一个 faiss index，OpenMP 并行
+    client = get_faiss_client()        # 进程级复用，避免每图重复加载 7×3.1GB 索引
 
-    variant_map = build_variant_map()
-    basename_index = build_basename_index(variant_map)
+    variant_map, basename_index = get_variant_maps()   # 进程级缓存，避免每图重读 metadata
 
     t_enc0 = time.time()
     query_sets = encoder.get_dim_patch_sets_parallel(user_img)
@@ -205,7 +238,7 @@ def run_inference(user_img_path: str,
     except Exception:  # noqa: BLE001
         pass
 
-    generator = GuidanceGenerator()
+    generator = GuidanceGenerator(model_spec=vlm_model) if vlm_model else GuidanceGenerator()
     t_vlm0 = time.time()
     try:
         solutions, js_path, edit_paths = generator.generate_solutions_and_save(
@@ -213,7 +246,12 @@ def run_inference(user_img_path: str,
             output_dir=output_dir, n_solutions=n_solutions, max_new_tokens=max_new_tokens,
             retrieval_s=retrieval_s, encode_s=encode_s, faiss_search_s=faiss_search_s,
             image_edit_enabled=image_edit,
+            image_edit_async=IMAGE_EDIT_ASYNC,   # 图编后台异步，与下一张图的检索/生成重叠
         )
+        _edit_on = IMAGE_EDIT_ENABLED if image_edit is None else image_edit
+        if _edit_on and IMAGE_EDIT_ASYNC:
+            print("[user] 图编已转入后台异步（不阻塞返图）；本批全部处理完会统一等待完成",
+                  flush=True)
     except Exception as exc:  # noqa: BLE001
         # 生成失败也要落盘一份 JSON（含各阶段计时），方便查看时延，而不是只打一行错误后丢弃
         vlm_s = time.time() - t_vlm0

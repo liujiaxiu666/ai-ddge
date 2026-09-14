@@ -15,9 +15,19 @@
 
 import os
 
+# ⚠️ CUDA 默认按 FASTEST_FIRST 枚举设备，序号与 nvidia-smi 顺序不一致（本机 8 卡时刚好相反：
+#    CUDA 0-3 = Ada，CUDA 4-7 = Blackwell）。不锁定的话，.env / "auto" 里按 nvidia-smi 写的卡号
+#    会落到别的卡上（曾选到 sm_120 的 Blackwell，torch cu126 无对应内核 -> "no kernel image"）。
+#    必须在 import torch（首次 CUDA 调用）之前生效，所以放在 config 最前面做全局兜底。
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
-# ---- 加载 .env（本仓库 .env 优先，再回退 backend/.env 补 QWEN_API_KEY），失败静默 ----
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ============================================================================
+# 0. 内部函数（全部集中在这里；下面只剩“配置项”，改参数一眼可见）
+# ============================================================================
 def _load_dotenv(*paths: str) -> None:
+    """把 .env 里的 KEY=VALUE 读进环境变量（已存在的环境变量优先，不覆盖）。失败静默。"""
     for path in paths:
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -33,9 +43,77 @@ def _load_dotenv(*paths: str) -> None:
             continue
 
 
+def _data_path(rel: str) -> str:
+    """共享盘规范路径优先；本机挂载点不同（未挂载）时回退仓库内 dataset/ 软链。
+    子目录尚不存在时也返回本地挂载点路径（避免落到本机并不存在的规范路径）。"""
+    abs_p = os.path.join(_SHARED_DATA, rel)
+    if os.path.exists(abs_p):
+        return abs_p
+    link_p = os.path.join(_REPO_DIR, "dataset", rel)
+    if os.path.isdir(os.path.dirname(link_p)):
+        return link_p
+    return abs_p
+
+
+def resolve_local_model(spec: str) -> str:
+    """把 'local/xxx'、相对名或绝对路径解析为绝对权重路径。"""
+    s = spec.strip().replace("\\", "/")
+    s = os.path.expanduser(s)
+    if s.startswith("local/"):
+        s = s[len("local/"):]
+    if os.path.isabs(s):
+        return s
+    return os.path.join(LOCAL_MODEL_ROOT, s)
+
+
+def parse_model_spec(spec: str):
+    """返回 (provider, model_name)。规则：
+    - 绝对路径 / 'local/'       -> 本地 transformers
+    - 'vllm/xxx'                -> 本地 vLLM
+    - 裸模型名 'qwen3.8-flash'  -> DashScope 原生接口（可思考）；'qwen38/xxx' 同义
+    - 'qwen/xxx' 等带前缀        -> 前缀即 provider，取前缀后为 model
+    - 其他裸名                   -> 本地 transformers
+    """
+    s = spec.strip().replace("\\", "/")
+    if not s:
+        return "local", ""
+    if os.path.isabs(s) or s.startswith("local/"):
+        return "local", s if os.path.isabs(s) else s[len("local/"):]
+    if s.startswith(("qwen3.8", "qwen3-8")):          # 裸模型名，如 qwen3.8-flash
+        return "qwen38", s
+    if "/" in s:
+        p, n = s.split("/", 1)
+        return ("qwen38" if p in ("qwen38", "qwen3.8") else p), n
+    return "local", s
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """同名环境变量优先（1/true/yes/on），否则用 config 里的默认值。"""
+    v = os.getenv(name, "").strip().lower()
+    if v:
+        return v in ("1", "true", "yes", "on")
+    return bool(default)
+
+
+def vlm_generator_model() -> str:
+    """【不用改这里】读取下面的 VLM_GENERATOR_MODEL；命令行/环境变量可临时覆盖。"""
+    return os.getenv("VLM_GENERATOR_MODEL") or VLM_GENERATOR_MODEL
+
+
+def vlm_enable_thinking() -> bool:
+    """【不用改这里】读取下面的 VLM_ENABLE_THINKING；命令行/环境变量可临时覆盖。"""
+    return _env_flag("VLM_ENABLE_THINKING", VLM_ENABLE_THINKING)
+
+
+def qwen_api_key() -> str:
+    """DashScope 默认用哪个 key：优先 QWEN_API_KEY_2（旧 QWEN_API_KEY 可能欠费/限额）。"""
+    return QWEN_API_KEY_2 or QWEN_API_KEY
+
+
+# 读 .env（本仓库优先，再回退 backend/.env）
 _load_dotenv(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),  # 本仓库 .env（GPU / key 可自配）
-    "/workspace/ai-camera-coach-app/backend/.env",                       # 回退：老项目 QWEN_API_KEY
+    os.path.join(_REPO_DIR, ".env"),
+    "/workspace/ai-camera-coach-app/backend/.env",
 )
 
 # ============================ 1. 7 维度定义 ============================
@@ -78,25 +156,8 @@ DIM_CONDITION_PROMPTS = {
 }
 
 # ============================ 2. 数据路径（共享盘绝对路径） ============================
-# 所有大数据在共享盘 `/gpfs3/area1/shared/ai-ddge/`（NFS 规范路径）。不同机器对该共享点的
-# 挂载路径可能不同（例如本机挂到 /datasets），故 _data_path() 优先用规范绝对路径，若本机
-# 未挂载则回退到仓库内 dataset/ 软链（dataset -> 共享盘根）。也可用环境变量覆盖。
+# 大数据在共享盘（本机实际挂载点为 /datasets）；_data_path() 会自动回退到仓库内 dataset/ 软链。
 _SHARED_DATA = os.getenv("DDGE_SHARED_DATA", "/gpfs3/area1/shared/ai-ddge")
-_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _data_path(rel: str) -> str:
-    """共享盘规范绝对路径优先；本机挂载点不同（不可达）时回退仓库内 dataset/ 软链。
-    ⚠️ 子目录尚不存在时也返回本地 dataset 挂载点路径（调用方会 os.makedirs），
-       避免落到本机并不存在的 /gpfs3 规范路径上。"""
-    abs_p = os.path.join(_SHARED_DATA, rel)
-    if os.path.exists(abs_p):
-        return abs_p
-    link_p = os.path.join(_REPO_DIR, "dataset", rel)
-    if os.path.isdir(os.path.dirname(link_p)):      # 本地 dataset 挂载点在，优先走它
-        return link_p
-    return abs_p
-
 
 # AesRecon 根目录（其下为 AesRecon_dataset/）
 AESRECON_ROOT = os.getenv("AESRECON_ROOT", _data_path("AesRecon"))
@@ -115,108 +176,70 @@ USE_POOR_AS_INDEX = True
 # 索引用坏图时若不去重，同一坏图会被多个样本各建一份 -> 检索分数相同、证据重复进 prompt。
 DEDUP_INDEX_IMAGE = True
 
-# ============ 3. 模型配置（编码 / 生成VLM，可自选） ============
-# 运行设备：保持 "cuda"（跟随 CUDA_VISIBLE_DEVICES 指定的卡，见下）。⚠️ 不要写成 "cuda:1"
-# 这类带序号的写法——CUDA_VISIBLE_DEVICES 过滤后只剩一张卡（映射为 cuda:0），写死了会越界报
-# invalid device ordinal。选哪张卡请在 .env 里改 CUDA_VISIBLE_DEVICES（0/1/2/3 或 auto）。
-DEVICE = "cuda"
-DTYPE = "bfloat16"                # 或 "float16"
-
-# 本地模型根目录（相对名都拼到这里；换机器时改这一行为你的权重目录即可）
+# ============================================================================
+# 3. ★模型设置（最常改：① 编码器 1 行 / ② 生成 VLM 1 行 / ③ 思考模式开关）
+# ============================================================================
+# 本地模型根目录（相对名都拼到这里；换机器改这一行）
 LOCAL_MODEL_ROOT = "/workspace/ai-camera-coach-app/backend/local_model_checkpoints"
 
-# ---- 编码器（4B / 8B 任选，或写任意本地目录名/绝对路径）----
-ENCODER_MODEL = "Qwen3-VL-4B-Instruct"      # 默认已切 4B
+# 运行设备：保持 "cuda"（跟随 CUDA_VISIBLE_DEVICES）。⚠️ 别写 "cuda:1" 这种带序号的，
+# 过滤后只剩一张卡会越界；选卡请在 .env 里改 CUDA_VISIBLE_DEVICES。
+DEVICE = "cuda"
+DTYPE = "bfloat16"                 # 或 "float16"
+
+# ---- ① 编码器（出 7 维特征；4B / 8B 任选）----
+ENCODER_MODEL = "Qwen3-VL-4B-Instruct"
 # ENCODER_MODEL = "Qwen3-VL-8B-Instruct"
 
-# ---- 生成 VLM（provider/model 风格，同 backend/.env）----
-VLM_GENERATOR_MODEL = "qwen/qwen3-vl-flash-2026-01-22"        # 远程 DashScope
-# VLM_GENERATOR_MODEL = "vllm/Qwen3-VL-8B-Instruct"            # 本地 vLLM
-# VLM_GENERATOR_MODEL = "local/Qwen3-VL-8B-Instruct"           # 本地 transformers
-# VLM_GENERATOR_MODEL = "/workspace/ai-camera-coach-app/backend/local_model_checkpoints/Qwen2-VL-2B-Instruct"
-# 与编码器同一模型（Qwen3-VL-4B）：多模型缓存只驻留一份权重，显存最省、质量好、实测不 OOM
-# VLM_GENERATOR_MODEL = "local/Qwen3-VL-4B-Instruct"
-# VLM_GENERATOR_MODEL = os.getenv("VLM_GENERATOR_MODEL", "local/Qwen3-VL-8B-Instruct")
+# ---- ② 生成 VLM（改下面这一行即可切换；也可 CLI --vlm 或环境变量 VLM_GENERATOR_MODEL 覆盖）----
+#   qwen3.8-flash                    DashScope 原生多模态接口（直接写模型名，支持思考）
+#   qwen/qwen3-vl-flash-2026-01-22   DashScope OpenAI 兼容接口（默认）
+#   vllm/Qwen3-VL-8B-Instruct        本地 vLLM（VLLM_BASE_URL）
+#   local/Qwen3-VL-4B-Instruct       本地 transformers（权重名/绝对路径）
+# VLM_GENERATOR_MODEL = os.getenv("VLM_GENERATOR_MODEL", "qwen/qwen3-vl-flash-2026-01-22")
+VLM_GENERATOR_MODEL = "qwen3.8-flash"
 
-# ---- 服务地址 / Key ----
+# ---- ③ 思考模式：★ 就在这里改 ----
+# True  = 开思考（更细，但慢很多：短请求实测 12.6s vs 1.1s）
+# False = 关思考（快）
+# 临时覆盖：命令行 --enable-thinking / 环境变量 VLM_ENABLE_THINKING=0
+VLM_ENABLE_THINKING = 0
+
+# ---- 服务地址 / Key（一般不用改）----
 VLLM_BASE_URL = "http://localhost:8003/v1"
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# qwen3.8-flash 走 DashScope 原生多模态接口（纯 requests，无需 SDK/代理），支持 enable_thinking
+QWEN38_API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
-
-# ---- qwen 多 key 并发池（DashScope 限流/余额不足规避）----
-# 单 key 并发过高易 429，且个别 key 可能余额不足：用多个 key 分摊，默认 3 个 key ——
-# 前两个各 2 并发、第三个 1 并发（共 5 并发）。某个 key 失败时并发池自动换剩余 key 重试（不跳过）。
-# 从 .env 读取 QWEN_API_KEY / QWEN_API_KEY_2 / QWEN_API_KEY_3（空 key 自动跳过，并发槽相应减少）。
 QWEN_API_KEY_2 = os.getenv("QWEN_API_KEY_2", "")
 QWEN_API_KEY_3 = os.getenv("QWEN_API_KEY_3", "")
-# (key, 并发槽数) 列表，顺序即权重轮询顺序
+# (key, 并发槽数)：第一个是有余额的 QWEN_API_KEY_2；旧 QWEN_API_KEY 若欠费，池子会自动换 key
 QWEN_API_KEYS_CONCURRENCY = [
-    (QWEN_API_KEY, 2),
     (QWEN_API_KEY_2, 2),
-    (QWEN_API_KEY_3, 1),
+    (QWEN_API_KEY_3, 2),
+    (QWEN_API_KEY, 1),
 ]
 
-
-# ---- 解析助手 ----
-def resolve_local_model(spec: str) -> str:
-    """把 'local/xxx'、相对名、或绝对路径解析为绝对权重路径。"""
-    s = spec.strip().replace("\\", "/")
-    s = os.path.expanduser(s)
-    if s.startswith("local/"):
-        s = s[len("local/"):]
-    if os.path.isabs(s):
-        return s
-    return os.path.join(LOCAL_MODEL_ROOT, s)
-
-
-def parse_model_spec(spec: str):
-    """返回 (provider, model_name)；绝对路径 / local/ 前缀都视为本地模型。"""
-    s = spec.strip().replace("\\", "/")
-    if not s:
-        return "local", ""
-    if os.path.isabs(s) or s.startswith("local/"):
-        return "local", s if os.path.isabs(s) else s[len("local/"):]
-    if "/" in s:
-        p, n = s.split("/", 1)
-        return p, n
-    return "local", s
-
-
-# 编码器 / 生成 VLM 的最终解析结果
+# ---- 由上面的模型设置派生（不用改）----
 ENCODER_MODEL_PATH = resolve_local_model(ENCODER_MODEL)
 VLM_PROVIDER, VLM_MODEL_NAME = parse_model_spec(VLM_GENERATOR_MODEL)
-
-# 使用的 GPU：单卡数字（"1"）或多卡逗号列表（"0,1,2"）；"auto"=自动选一张最空闲卡。
-# 在本仓库 .env 里写 CUDA_VISIBLE_DEVICES=... 即可。多卡时文件夹批量推理自动多进程并行（每卡一个 worker）。
-CUDA_VISIBLE_DEVICES = os.getenv("CUDA_VISIBLE_DEVICES", "auto")
-# 解析出的卡列表（多卡或单卡；"auto"/空 -> None）
+# 使用的 GPU：单卡 "1" 或多卡 "0,1,2"；"auto"=自动选一张最空闲卡。多卡时批量推理自动多进程并行。
+# ⚠️ 编号与 nvidia-smi 完全一致（下面已锁定 CUDA_DEVICE_ORDER=PCI_BUS_ID）。
+#    本机 8 卡：nvidia-smi 0-3 = RTX PRO 5000 Blackwell(sm_120)，需 CUDA 12.8+ 的 torch；
+#               nvidia-smi 4-7 = RTX 5880 Ada(sm_89)，torch cu126 可直接用。
+CUDA_VISIBLE_DEVICES = os.getenv("CUDA_VISIBLE_DEVICES") or "auto"   # 也可直接写 "6" 或 "4,5,6,7"
 GPU_IDS = [int(x) for x in str(CUDA_VISIBLE_DEVICES).split(",") if x.strip().isdigit()] or None
 
-# 编码器输入图像最大像素数（控制视觉 patch 数量）
-IMAGE_MAX_PIXELS = 524_288         # 0.5MP = 1024*512
-
-# patch 集合池化：每维度 N 个 patch 池化成 K 个（K<=N）
-PATCH_POOL_K = 64
-
-# 编码并发：逐维编码时同时编码的维度数。
-# 1 = 串行（最稳：单线程 GPU 前向不触发 OpenBLAS 段错误，显存峰值 ≈ 模型+1 图，连续多张稳定，
-#     速度与 batch 相当，约 2.8s/张）；>1 并发虽快但多线程 GPU 前向易触发 BLAS 崩溃（默认 1）。
-ENCODE_MAX_CONCURRENCY = 5
-# 是否用 batch 前向（7 个条件一次跑完，最快但显存峰值最高，单卡 24GB 连续处理多张易 OOM）。
-# 默认 False：用串行逐维编码，显存水位低、连续多张稳定。
-# ENCODE_USE_BATCH = False
-ENCODE_USE_BATCH = True
-
-# 共享视觉塔编码（方案 B）：视觉塔（Qwen3-VL DeepStack，输出与文本完全无关）只跑 1 次，
-# 缓存 pooler_output + deepstack_features 平铺到 batch 行，再做一次 batch LLM 前向。
-#   - 相对 _batch_forward（视觉算 7 遍）：约快 ~23%、显存更低；
-#   - 结果与「逐维单图前向」cos≈0.999、与 _batch_forward cos≈0.994（均为 FA/batch-vs-single
-#     的 fp 数值差，非语义差异；B 自身 run-to-run 逐位确定）；
-# ⚠️ 需直连 HF 内部子模块（lm.language_model / get_image_features / compute_3d_position_ids）、
-#     transformers 大版本升级可能失效。
-# 索引库也随此开关自动切换（True->B 库，False->A 库，见第 4 节）：向量与索引同源，杜绝混搭。
-# 简单切换：直接改下面默认值 1/0，或环境变量 DDGE_SHARED_VISION=1/0 覆盖。
-ENCODE_SHARED_VISION = os.getenv("DDGE_SHARED_VISION", "1").strip().lower() in ("1", "true", "yes", "on")
+# ---- 编码参数（一般不用改）----
+IMAGE_MAX_PIXELS = 524_288         # 编码器输入图最大像素数（0.5MP=1024*512），控制 patch 数量
+PATCH_POOL_K = 64                  # 每维 N 个 patch 池化成 K 个（K<=N）
+ENCODE_MAX_CONCURRENCY = 5         # 逐维编码并发；1=串行最稳（多线程 GPU 前向易触发 BLAS 崩溃）
+ENCODE_USE_BATCH = True            # 7 条件一次 batch 前向（最快，显存峰值最高）
+# 共享视觉塔（方案 B）：视觉塔只前向 1 次，缓存特征平铺到 batch → 再跑一次 LLM 前向。
+# 比 _batch_forward 约快 23%、显存更低（结果 cos≈0.994，纯 fp 数值差）。
+# 索引库随此开关自动切换（True->B 库 / False->A 库，见第 4 节），向量与索引同源。
+DDGE_SHARED_VISION = True          # 直接在这里改；环境变量 DDGE_SHARED_VISION=1|0 可覆盖
+ENCODE_SHARED_VISION = _env_flag("DDGE_SHARED_VISION", DDGE_SHARED_VISION)
 
 # ============================ 4. FAISS 索引（默认检索后端） ============================
 # 方案：每维一个 faiss IndexFlatIP（暴力精确，无近似损失），faiss 内部 OpenMP 多线程，
@@ -271,18 +294,22 @@ AGG_POOL_TOPK = 8
 # 流式生成采样温度（>0 才有创造性差异）
 GEN_TEMPERATURE = 0.9
 
-# ============ 5.2 模型选择（见第 3 节统一定义） ============
-# 生成 VLM：VLM_GENERATOR_MODEL（qwen/... | vllm/... | local/...）
+# ============ 5.2 模型选择（见第 3 节 ★模型设置） ============
+# 生成 VLM：VLM_GENERATOR_MODEL（qwen3.8-flash | qwen/... | vllm/... | local/...）
 # 编码器：ENCODER_MODEL（4B / 8B）；图编模型见下方 IMAGE_EDIT_MODEL
 
 # 图编模型：生成方案后并行对用户照片做实际编辑（qwen-image 系列，DashScope）
 # 默认关闭：当前环境没有 qwen 预算时，先只做检索 + prompt 生成，避免意外调用付费接口。
 # 触发方式：CLI `infer --image-edit` 强制开启；不传该参数时按本开关决定。
-IMAGE_EDIT_ENABLED = os.getenv("IMAGE_EDIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMAGE_EDIT_ENABLED = True    # 默认是否图编；CLI `--image-edit` 可强制开启
 IMAGE_EDIT_MODEL = "qwen/qwen-image-2.0-2026-03-03"
 IMAGE_EDIT_SIZE = "1024*1024"
 IMAGE_EDIT_PARALLEL = True   # 多方案并行编辑
 IMAGE_EDIT_MAX_WORKERS = 2   # 图编并发数（DashScope qwen-image 限流严格，3 并发仍会 429，2 更稳）
+# 批处理：图编提交后台异步执行，与下一张图的「检索+生成」重叠，缩短总墙钟时间；
+# 批处理结束/进程退出前由 prompt.wait_pending_edits() 统一等待，结果不会丢。
+# 可用环境变量 IMAGE_EDIT_ASYNC=0 关闭（关闭后图编同步阻塞、run_inference 返回已完成的编辑图）。
+IMAGE_EDIT_ASYNC = os.getenv("IMAGE_EDIT_ASYNC", "1").strip().lower() in ("1", "true", "yes", "on")
 # 图编 prompt 取哪段："full"=整份方案；"advice"=只取“# 针对性整改建议”段（更聚焦可执行）
 IMAGE_EDIT_PROMPT_SECTION = "advice"
 
@@ -302,9 +329,9 @@ MAX_DIM_EVIDENCE = 10
 # False：方案 k = 该维第 k 张候选好图，多份方案可能共用同一张 poor（只是换其不同 good 变体）；
 # True ：方案 k = 第 k 张【不同】poor 图的第一张好图，方案间按 poor 图去重（方案数 ≤ 命中不同 poor 数）。
 # 可用 DDGE_FIRST_GOOD_PER_POOR=1/0 覆盖（A/B 对比用）。
-EVIDENCE_FIRST_GOOD_PER_POOR = os.getenv("DDGE_FIRST_GOOD_PER_POOR", "1").strip().lower() in ("1", "true", "yes", "on")
+EVIDENCE_FIRST_GOOD_PER_POOR = _env_flag("DDGE_FIRST_GOOD_PER_POOR", True)
 # 每个方案每个维度只送 1 张候选好图 + 对应 1 条文本（方案 k 用每维第 k 张；绝不发送该维全部文本）。
 # 参考图数量因此固定为每维 1 张，无需再配置（原 GOOD_IMAGE_PER_DIM 已移除）。
 
 # ============================ 6. 输出 ============================
-OUTPUT_DIR = "./output/0907_sv_FIRST_GOOD_PER_POOR"
+OUTPUT_DIR = "./output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1"

@@ -28,20 +28,66 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 from config import CUDA_VISIBLE_DEVICES  # noqa: E402
 
 
-# ⚠️ 必须在 import torch 之前设置 CUDA_VISIBLE_DEVICES：否则 torch 会看到全部 GPU，
-#    device_map 会把层分散/offload 到 CPU，导致 device mismatch 崩溃
-#    （共享机器上其他用户占满部分卡时尤其容易触发）
+# ⚠️ 必须在 import torch 之前设置 CUDA_DEVICE_ORDER + CUDA_VISIBLE_DEVICES：
+#    1) CUDA 默认按 FASTEST_FIRST 枚举设备，序号与 nvidia-smi 的编号不一致
+#       （本机 8 卡：CUDA 0-3 = RTX 5880 Ada(sm_89)，CUDA 4-7 = RTX PRO 5000 Blackwell(sm_120)）。
+#       不锁定顺序时，.env 里按 nvidia-smi 写的 "7"（Ada）会落到 CUDA 的 7 号卡 = Blackwell，
+#       torch cu126 没有 sm_120 内核 -> "CUDA error: no kernel image is available for execution"。
+#       锁定 PCI_BUS_ID 后序号与 nvidia-smi 完全一致，选卡所见即所得。
+#    2) torch 一旦初始化 CUDA，这两个变量再改就无效了；
+#       CUDA_VISIBLE_DEVICES 不早设还会让 torch 看到全部 GPU（device_map 会 offload 到 CPU）。
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+
+def _cc_pair(cc: str) -> tuple:
+    """算力字符串 -> (major, minor)。'12.0'/'sm_90a'/'8.6' 都能解析；失败返回 (-1, -1)。"""
+    digits = "".join(ch for ch in str(cc) if ch.isdigit())
+    if not digits:
+        return (-1, -1)
+    return (int(digits[:-1]), int(digits[-1])) if len(digits) >= 2 else (int(digits), 0)
+
+
+def _caps_support(caps: set, cc: tuple) -> bool:
+    """当前 torch 能否在该算力上跑：CUDA 同大版本内向前二进制兼容
+    （sm_86 的 cubin 能在 sm_89 上跑），所以 major 相同且 minor 不低于即可。"""
+    return any(c[0] == cc[0] and c[1] <= cc[1] for c in caps)
+
+
+def _torch_supported_caps() -> set:
+    """当前 torch 编译进去的算力集合（如 {(5,0)...(9,0)}）；失败返回空集合 = 不限制。
+    只读 torch.cuda.get_arch_list()，不初始化 CUDA。"""
+    try:
+        import torch
+        return {_cc_pair(a[3:]) for a in torch.cuda.get_arch_list() if a.startswith("sm_")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _auto_pick_gpu() -> str:
-    """用 nvidia-smi 选当前显存最空闲的 GPU；失败回退 '0'。"""
+    """用 nvidia-smi 选当前显存最空闲的 GPU，跳过当前 torch 跑不了的算力（如 sm_120 + cu126）；
+    失败回退 '0'。返回的索引与 nvidia-smi 一致（前面已锁定 CUDA_DEVICE_ORDER=PCI_BUS_ID）。"""
     try:
         import subprocess
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,memory.free,compute_cap",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
-        rows = [ln.strip().split(",") for ln in out.stdout.strip().splitlines() if ln.strip()]
-        best = max(rows, key=lambda r: int(r[1].strip()))
-        return best[0].strip()
+        rows = []
+        for ln in out.stdout.strip().splitlines():
+            parts = [x.strip() for x in ln.split(",")]
+            if len(parts) >= 3 and parts[0].isdigit():
+                rows.append((parts[0], int(parts[1]), _cc_pair(parts[2])))
+        if not rows:
+            return "0"
+        caps = _torch_supported_caps()
+        usable = [r for r in rows if _caps_support(caps, r[2])]
+        if usable:
+            return max(usable, key=lambda r: r[1])[0]
+        print(f"[encoder] ⚠️ 所有卡算力 {sorted({r[2] for r in rows})} 都不被当前 torch 支持"
+              f"（支持 {sorted(caps)}），仍选显存最大的一张；请换卡或安装匹配 CUDA 的 torch",
+              flush=True)
+        return max(rows, key=lambda r: r[1])[0]
     except Exception:  # noqa: BLE001
         return "0"
 
@@ -57,7 +103,8 @@ elif CUDA_VISIBLE_DEVICES.strip().lower() in ("auto", ""):
 else:
     os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-print(f"[encoder] CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}")
+print(f"[encoder] CUDA_VISIBLE_DEVICES = {os.environ['CUDA_VISIBLE_DEVICES']}"
+      f"（按 nvidia-smi 编号）")
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -66,6 +113,28 @@ from PIL import Image
 
 import torch
 import torch.nn.functional as F
+
+
+def _check_device_supported() -> None:
+    """可见卡算力不在当前 torch 支持列表时，给出比 torch 原生警告更可操作的提示
+    （否则前向只报 'CUDA error: no kernel image is available for execution on the device'）。"""
+    try:
+        if not torch.cuda.is_available():
+            return
+        cc = tuple(torch.cuda.get_device_capability(0))
+        caps = _torch_supported_caps()
+        if caps and not _caps_support(caps, cc):
+            print(f"[encoder] ❌ 当前可见卡 {torch.cuda.get_device_name(0)} 算力 sm_{cc[0]}{cc[1]} "
+                  f"不在 torch {torch.__version__}(cuda {torch.version.cuda}) 支持列表 "
+                  f"{sorted('sm_%d%d' % c for c in caps)} 内，前向会报 'no kernel image is available'。\n"
+                  f"[encoder]    解决：① Blackwell(sm_120) 需安装 CUDA 12.8+ 对应的 torch; "
+                  f"② 或改 .env 的 CUDA_VISIBLE_DEVICES 指向受支持的卡（编号同 nvidia-smi，"
+                  f"本机 Ada(sm_89) 卡号为 4,5,6,7）。", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_check_device_supported()
 
 # 可用 VL 生成类注册表（按权重 config.json 的 model_type 精确匹配，
 # 避免 Qwen3-VL 优先命中后拿错类去加载 Qwen2-VL 等不同结构权重）
