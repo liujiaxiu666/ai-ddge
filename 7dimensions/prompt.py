@@ -245,55 +245,63 @@ class GuidanceGenerator:
     # ------------------------------------------------------------------
     def build_solution_messages(self, user_img, evidence_by_dim: dict,
                                 solution_idx: int, n_solutions: int):
-        """返回 chat messages：
-        - 第 1 张图：用户实拍图片
-        - 每个维度组：只取该维第 solution_idx 张候选好图（**1 张图 + 1 条对应文本**）
-        - 本方案标识（方案 solution_idx / 共 n_solutions）+ 输出格式
+        """返回 chat messages（简洁版）：
+        - 用户实拍图只放 1 次（唯一分析对象，不再首尾重复）；
+        - “参考内容来自他人作品、非分析对象”只统一声明 1 次，不再逐维度重复；
+        - 每个维度只取第 solution_idx 张候选好图（1 图 + 1 条文本）。
         硬性约束：每个方案每个维度**只**用 1 张好图 + 对应 1 条文本，绝不发送该维全部文本。
         """
         content = []
 
-        # ---- 用户实拍图片 ----
-        content.append({"type": "text", "text": f"用户实拍图片（第 {solution_idx}/{n_solutions} 个方案）："})
-        content.append({"type": "image", "image": user_img})
+        # ---- ① 任务说明：先说清“先看参考资料，最后给分析对象” ----
         content.append({"type": "text", "text": (
-            "你是图片审美诊断助手。基于用户原图与分组参考证据，输出一份拍照整改方案。\n"
-            f"本方案参考证据：每个维度检索到的第 {solution_idx} 张候选好图及其文本（方案 {solution_idx}）。\n"
-            "要求：\n"
-            "1. 先诊断用户照片 7 个维度（比例、构图、机位、主体位置、姿态、对焦、色彩）的具体问题；\n"
-            "2. 对每个维度给出可落地的整改建议，且【只允许使用该维度本组证据】，禁止挪用其他组证据；\n"
-            "3. 只要该维提供了参考证据，就必须基于本组证据写出该维度的具体整改建议，严禁写“暂无该维度相关参考证据”；仅当某维确实完全没有提供任何证据时才允许写“暂无”，严禁编造摄影知识；\n"
-            "4. 参考图/参考文本是正确示范，借鉴其审美处理方式，但必须针对用户照片的具体问题原创给出，不照搬参考场景。\n"
-            "====分组参考证据（禁止跨分组挪用证据！）===="
+            f"你是图片审美诊断助手。本次要诊断【1 张】用户实拍照片的 7 个维度问题并给出整改建议"
+            f"（第 {solution_idx}/{n_solutions} 个方案）。\n"
+            "下面先给出参考资料（来自他人的优秀作品，**不是**用户拍的照片，仅供借鉴处理手法）；"
+            "资料之后才是唯一需要分析的对象——用户实拍图。"
         )})
 
-        # ---- 按维度分组参考证据：每个维度【只】取第 solution_idx 张候选好图（1 图 + 1 文）----
+        # ---- ② 参考资料（每维：标签 + 参考图 + 参考文本）----
+        content.append({"type": "text", "text":
+            "\n== 参考资料（均为他人作品，非用户照片，仅供借鉴处理手法）=="})
         for dim in DIM_ORDER:
             evs = (evidence_by_dim or {}).get(dim, [])
             if solution_idx - 1 >= len(evs):
                 content.append({"type": "text", "text":
-                    f"\n【{DIM_CN[dim]}维度】\n暂无该维度相关参考证据"})
+                    f"\n【{DIM_CN[dim]}·参考组】暂无参考证据"})
                 continue
-
             ev = evs[solution_idx - 1]
             content.append({"type": "text", "text":
-                f"\n【{DIM_CN[dim]}维度】\n[本方案参考：第 {solution_idx} 张候选好图（每维仅此 1 张）及其文本，必须基于该证据写出该维整改建议，严禁写“暂无该维度相关参考证据”]"})
+                f"\n【{DIM_CN[dim]}·参考组 #{solution_idx}（他人作品，非分析对象）】"})
             if INCLUDE_DIM_GOOD_IMAGE and ev.get("good_image_path"):
                 try:
                     content.append({"type": "image",
                                     "image": Image.open(ev["good_image_path"]).convert("RGB")})
                 except Exception:  # noqa: BLE001
                     pass
-            content.append({"type": "text", "text":
-                f"参考文本整改建议：{ev['dim_original_text']}"})
+            content.append({"type": "text", "text": f"参考文本：{ev['dim_original_text']}"})
 
+        # ---- ③ 用户实拍图：放在最后、紧贴任务（模型对最近内容最敏感，避免误把参考图当分析对象）----
+        content.append({"type": "text", "text":
+            "\n== 以上全部是参考资料。下面是唯一的分析对象 =="})
+        content.append({"type": "text", "text": "【用户实拍图·唯一分析对象】"})
+        content.append({"type": "image", "image": user_img})
+
+        # ---- ④ 任务与输出格式 ----
         content.append({"type": "text", "text": (
-            "\n请输出：\n"
-            f"# 方案{solution_idx} 拍照整改指导（参考每维度第 {solution_idx} 张候选好图）\n"
-            "# 拍照缺陷分析\n"
-            "- 画面比例：xxx\n- 构图取景：xxx\n……（7 个维度）\n\n"
-            "# 针对性整改建议\n"
-            "- 画面比例整改：xxx\n- 构图取景整改：xxx\n……"
+            "请只针对上面这张【用户实拍图】逐维度（比例/构图/机位/主体位置/姿态/对焦/色彩）"
+            "诊断具体问题，并给出可落地的整改建议。\n"
+            "约束：\n"
+            "① “用户图内容概述”与缺陷分析只能写这张用户实拍图里真实存在的东西；"
+            "严禁把参考资料的场景/道具/人物（例如长椅、木屋、汽车、路灯、旁人等）写进概述或分析；"
+            "某维度若没有问题就写“该维度未发现明显问题”。\n"
+            "② 每个维度只能借鉴该维度自己那组参考证据，禁止跨维度挪用；"
+            "已提供证据的维度不要写“暂无参考证据”。\n"
+            "\n请按下面格式输出：\n"
+            f"# 方案{solution_idx} 拍照整改指导\n"
+            "# 用户图内容概述\n（只看这张用户实拍图：一句话说清它的场景、人物与关键元素）\n"
+            "# 拍照缺陷分析\n- 画面比例：xxx\n- 构图取景：xxx\n……（7 个维度，均针对用户实拍图）\n"
+            "# 针对性整改建议\n- 画面比例整改：xxx\n- 构图取景整改：xxx\n……（7 个维度，均针对用户实拍图）"
         )})
 
         return [{"role": "user", "content": content}]
@@ -305,7 +313,8 @@ class GuidanceGenerator:
     def generate_stream(self, messages, max_new_tokens: int = GENERATE_MAX_NEW_TOKENS,
                         temperature: float = GEN_TEMPERATURE, api_key: str | None = None):
         if self.provider == "qwen38":
-            yield from self._qwen38_stream(messages, max_new_tokens, temperature)
+            yield from self._qwen38_stream(messages, max_new_tokens, temperature,
+                                           api_key=api_key)
             return
         if self.provider in ("qwen", "api", "vllm", "vllm-local"):
             yield from self._api_stream(messages, max_new_tokens, temperature, api_key=api_key)
@@ -340,15 +349,20 @@ class GuidanceGenerator:
     #          parameters:{result_format:"message", temperature, max_tokens, [enable_thinking]}}
     #   ⚠️ max_tokens 必须给足，否则长输出会被硬截断（这里直接用 max_new_tokens）。
     # ------------------------------------------------------------------
-    def _qwen38_stream(self, messages, max_new_tokens: int, temperature: float):
-        images, texts = [], []
+    def _qwen38_stream(self, messages, max_new_tokens: int, temperature: float,
+                       api_key: str | None = None):
+        # ⚠️ 必须保持 content 的原始顺序（维度标签 → 参考图 → 参考文本 → 用户图 → 任务）。
+        #    旧实现把图片全部堆到最前、文本堆到最后，导致模型无法把图片与其标签对应，
+        #    会挑错图当作“用户实拍图”去分析（方案 2/4/5 的概述曾写成参考图场景）。
+        content: list = []
         for msg in messages:
             for item in msg.get("content", []):
                 if item.get("type") == "text":
-                    texts.append(item.get("text", ""))
+                    t = item.get("text", "")
+                    if t:
+                        content.append({"text": t})
                 elif item.get("type") == "image":
-                    images.append({"image": _pil_to_b64(item["image"])})
-        content = images + [{"text": t} for t in texts if t]
+                    content.append({"image": _pil_to_b64(item["image"])})
         params = {"result_format": "message", "temperature": temperature,
                   "max_tokens": max_new_tokens}
         if getattr(self, "enable_thinking", False):
@@ -360,7 +374,7 @@ class GuidanceGenerator:
         last = None
         for attempt in range(VLM_API_MAX_RETRIES + 1):
             r = requests.post(self.api_base_url,
-                              headers={"Authorization": f"Bearer {self.api_key}",
+                              headers={"Authorization": f"Bearer {api_key or self.api_key}",
                                        "Content-Type": "application/json"},
                               json=body, timeout=600)
             if r.status_code == 200:
@@ -520,8 +534,10 @@ class GuidanceGenerator:
                                 "text": "", "error": str(e)}
             errors.append({"solution": k, "error": str(e)})
 
-        if self.provider in ("qwen", "api"):
-            # qwen(API)：走多 key 并发池（key1×2 + key2×2 + key3×1 = 5 并发；GENERATE_PARALLEL 不生效）
+        if self.provider in ("qwen", "api", "qwen38"):
+            # qwen / qwen38：都走多 key 并发池——某个 key 欠费(Arrearage)/限流(429)/失效时
+            # 自动换其余 key 重试，避免单 key 挂掉导致整批方案失败。
+            # 并发度 = QWEN_API_KEYS_CONCURRENCY 的槽位总和（KEY_3 未配置时少 2 槽）。
             from concurrent.futures import as_completed
             pool = get_qwen_api_pool()
             if n > 1:
@@ -543,8 +559,8 @@ class GuidanceGenerator:
                     _record_failure(1, e)
                 else:
                     _collect(1, sol)
-        elif (GENERATE_PARALLEL or self.provider == "qwen38") and n > 1:
-            # qwen38（远程 DashScope）并发调用更快：n 个方案同时发请求（远程 API 无显存争用）
+        elif GENERATE_PARALLEL and n > 1:
+            # 其它远程 provider（如 vllm）：并发调用更快（远程 API 无显存争用）
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=n) as ex:
                 futs = {ex.submit(_build_solution, None, k): k for k in range(1, n + 1)}
@@ -598,6 +614,9 @@ class GuidanceGenerator:
                 paths = []
                 good = [s for s in solutions if s.get("text")]   # 只对生成成功的方案图编
                 for i, (res, s) in enumerate(zip(edited, good), start=1):
+                    if not res:      # 该方案图编失败（超时等），跳过保存，不影响其它方案
+                        print(f"[prompt] 方案 {s.get('index')} 图编无结果，跳过保存", flush=True)
+                        continue
                     ep = os.path.join(out_dir, f"solution_{i}.png")
                     save_edit_image(res, ep)
                     paths.append(ep)

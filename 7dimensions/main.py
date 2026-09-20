@@ -22,7 +22,7 @@ CLI 入口：统一调度「离线入库」与「推理生成（多方案 + 图�
   python main.py infer --input /path/to/user_photo.jpg --n-solutions 5
   python main.py infer --input /workspace/ai-camera-coach-app/backend/test_data/0715/dataset_link/jingxuan --max-images 0
   # 模式 3：检索 + 生成方案 + 图像编辑（追加 --image-edit；缺省时按 config.IMAGE_EDIT_ENABLED）
-  python main.py infer --input /workspace/ai-camera-coach-app/backend/test_data/0715/flower100_20 --max-images 0  --n-solutions 5 --image-edit
+  python main.py infer --input /workspace/ai-camera-coach-app/backend/test_data/0715/flower100_20 --max-images 0  --n-solutions 5 --image-edit 
   # 整个文件夹（默认最多处理前 8 张，超出会被截断；--max-images 0 或单独 --max-images = 不限）
   python main.py infer --input /path/to/img_folder --max-images
   # 自定义：方案数上限 / 输出目录 / 生成 token 上限

@@ -196,8 +196,8 @@ ENCODER_MODEL = "Qwen3-VL-4B-Instruct"
 #   qwen/qwen3-vl-flash-2026-01-22   DashScope OpenAI 兼容接口（默认）
 #   vllm/Qwen3-VL-8B-Instruct        本地 vLLM（VLLM_BASE_URL）
 #   local/Qwen3-VL-4B-Instruct       本地 transformers（权重名/绝对路径）
-# VLM_GENERATOR_MODEL = os.getenv("VLM_GENERATOR_MODEL", "qwen/qwen3-vl-flash-2026-01-22")
-VLM_GENERATOR_MODEL = "qwen3.8-flash"
+VLM_GENERATOR_MODEL = os.getenv("VLM_GENERATOR_MODEL", "qwen3.8-flash ")
+# VLM_GENERATOR_MODEL = "qwen3.8-flash"
 
 # ---- ③ 思考模式：★ 就在这里改 ----
 # True  = 开思考（更细，但慢很多：短请求实测 12.6s vs 1.1s）
@@ -217,7 +217,7 @@ QWEN_API_KEY_3 = os.getenv("QWEN_API_KEY_3", "")
 QWEN_API_KEYS_CONCURRENCY = [
     (QWEN_API_KEY_2, 2),
     (QWEN_API_KEY_3, 2),
-    (QWEN_API_KEY, 1),
+    (QWEN_API_KEY, 2),
 ]
 
 # ---- 由上面的模型设置派生（不用改）----
@@ -302,8 +302,22 @@ GEN_TEMPERATURE = 0.9
 # 默认关闭：当前环境没有 qwen 预算时，先只做检索 + prompt 生成，避免意外调用付费接口。
 # 触发方式：CLI `infer --image-edit` 强制开启；不传该参数时按本开关决定。
 IMAGE_EDIT_ENABLED = True    # 默认是否图编；CLI `--image-edit` 可强制开启
-IMAGE_EDIT_MODEL = "qwen/qwen-image-2.0-2026-03-03"
-IMAGE_EDIT_SIZE = "1024*1024"
+# 图编模型（DashScope qwen-image 系列）。默认值可直接改下面这一行，也可不改代码就切换：
+#   ① 临时环境变量（只对本次命令生效）：
+#        IMAGE_EDIT_MODEL="qwen/qwen-image-3.0-pro" python main.py infer ... --image-edit
+#   ② 写进 .env：IMAGE_EDIT_MODEL=qwen/qwen-image-3.0-pro
+# 常用取值：qwen/qwen-image-3.0（加速版，默认）/ qwen/qwen-image-3.0-pro（质感更强、更贵）
+#   / qwen/qwen-image-2.0-2026-03-03（旧版，回退用）/ qwen/qwen-image-edit（纯编辑模型）
+IMAGE_EDIT_MODEL = os.getenv("IMAGE_EDIT_MODEL", "qwen/qwen-image-3.0")
+# 输出尺寸："auto"（默认）=【不传 size】，由模型按输入图比例自适应——
+#   实测 4:3 图自动输出 2352*1760 ≈ 4.1MP（比写死 2048*1536=3.15MP、1024*1024=1.05MP 都清晰）。
+#   也可写死，如 "2048*1536"（横图）/"1536*2048"（竖图）；模型上限约 2048*2048 总像素。
+IMAGE_EDIT_SIZE = os.getenv("IMAGE_EDIT_SIZE", "auto")
+# 送入图编模型前的最大像素（原图 5712x4284 会先缩到该上限内；太小会丢细节导致出图发糊，太大则慢且贵）
+IMAGE_EDIT_INPUT_MAX_PIXELS = int(os.getenv("IMAGE_EDIT_INPUT_MAX_PIXELS", str(2048 * 2048)))
+# 单次图编请求超时（秒）。3.0 在高分辨率（auto ≈ 4MP）下单张可能超过 5 分钟，并发时还要排队；
+# 原来硬编码 300s 会直接 ReadTimeout。超时会记为该 key 本次失败并换 key 重试。
+IMAGE_EDIT_TIMEOUT = int(os.getenv("IMAGE_EDIT_TIMEOUT", "600"))
 IMAGE_EDIT_PARALLEL = True   # 多方案并行编辑
 IMAGE_EDIT_MAX_WORKERS = 2   # 图编并发数（DashScope qwen-image 限流严格，3 并发仍会 429，2 更稳）
 # 批处理：图编提交后台异步执行，与下一张图的「检索+生成」重叠，缩短总墙钟时间；
@@ -334,4 +348,4 @@ EVIDENCE_FIRST_GOOD_PER_POOR = _env_flag("DDGE_FIRST_GOOD_PER_POOR", True)
 # 参考图数量因此固定为每维 1 张，无需再配置（原 GOOD_IMAGE_PER_DIM 已移除）。
 
 # ============================ 6. 输出 ============================
-OUTPUT_DIR = "./output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1"
+OUTPUT_DIR = "./output/0920_sv_FIRST_GOOD_PER_POOR_qwen3.8flash_qwenimage3.0"

@@ -17,14 +17,24 @@ prompt 的 good 图 / dim_original_text）以及 solutions（每个 direction �
   方案 k 每个维度取检索结果第 k 条证据（1 张 poor + 1 张 good + 1 条指导文本）；
   每方案展示其生成图（solutions.json 的 edit_image / solution_N.png）。
 
+版式二选一（--layout）：
+  full（默认）：上面那套「证据 + 缺陷分析 + 整改建议 + 生成图」，每方案 2 页；
+  images      ：只放图片，不放任何分析/建议。每页 4 列，从左到右 = 原图、方案 k、k+1、k+2；
+                每张原图 5 个方案 → 2 页（1~3 / 4~5），底部只有图注。
+
 用法（整批 -> 单份报告，保存到输入测试路径）：
-  python make_ppt_0901.py \
-      --results-dir /workspace/ai-ddge/7dimensions/output/0907_sv \
-      --save-dir   /workspace/ai-ddge/7dimensions/output/0907_sv \
-      --data-root  /workspace/ai-ddge/7dimensions/dataset
+  cd /workspace/ai-ddge/7dimensions/show
+python make_fig_show.py \
+  --results-dir /workspace/ai-ddge/7dimensions/output/0920_sv_FIRST_GOOD_PER_POOR_qwen3.8flash \
+  --save-dir   /workspace/ai-ddge/7dimensions/output/0920_sv_FIRST_GOOD_PER_POOR_qwen3.8flash \
+  --layout images
+# 默认输出文件名：<结果目录名>_图片版报告.pptx / .pdf（不覆盖完整版报告）
+
+  # 只出图片版（每页 4 列：原图 + 3 个方案，5 方案 = 2 页）
+  #   python make_fig_show.py --results-dir ... --layout images
   # 可选：--only "669da389b6114a208175994fa13af3fe" 只处理某一张
   #       --max-solutions 3 每张只取前 N 个方案
-  #       --out-name "0830报告" 自定义输出文件名（默认=<结果目录名>_报告）
+  #       --out-name "0830报告" 自定义输出文件名（默认=<结果目录名>_报告 / _图片版报告）
 说明：
   - 整个结果目录的所有图片会合成「单份」pptx + pdf（不是每张一个）。
   - 每个方案每维度只取第 k 条证据（1 poor + 1 good + 1 指导文本），适配新数据构成。
@@ -129,6 +139,14 @@ IMG_CAP_H = 0.13            # 图注高度
 GEN_W2 = 3.2                # 第 2 页生成图放大宽度（建议区右侧）
 PAGE1_DIMS = DIM_ORDER[:5]           # 第 1 页右侧 5 行：ratio..pose
 PAGE2_TOP_DIMS = DIM_ORDER[5:]       # 第 2 页右上 2 行：focus, color
+
+# ---- 仅图片版式（每页 4 列：原图 + 3 个方案生成图；5 个方案 = 2 页）----
+IMG_ONLY_COLS = 4           # 每页列数
+IMG_ONLY_PER_PAGE = IMG_ONLY_COLS - 1      # 每页放几个方案（3）-> 5 方案 = 2 页
+IMG_ONLY_GAP = 0.22         # 列间距
+IMG_ONLY_CAP_H = 0.34       # 每列底部图注高度
+IMG_ONLY_TITLE_SIZE = 15
+IMG_ONLY_CAP_SIZE = 11
 
 # ---------------------------------------------------------------------------
 # 解析 solutions.json
@@ -427,6 +445,61 @@ def build_slides(data, roots):
     return slides
 
 
+def build_slides_images_only(data):
+    """仅图片版式：不展示分析与建议，只放【原图 + 各方案的生成图】。
+    每页 4 列，从左到右 = 原图、方案 k、k+1、k+2；每张原图 5 个方案 -> 共 2 页。
+    """
+    orig = data["input_image"]
+    sols = list(data["solutions"])
+    chunks = [sols[i:i + IMG_ONLY_PER_PAGE]
+              for i in range(0, len(sols), IMG_ONLY_PER_PAGE)] or [[]]
+    n_pages = len(chunks)
+    col_w = (PAGE_W - 2 * MARGIN - (IMG_ONLY_COLS - 1) * IMG_ONLY_GAP) / IMG_ONLY_COLS
+    img_h = CONTENT_H - IMG_ONLY_CAP_H
+    dims_cache: dict = {}
+
+    def _fit(path: str):
+        """按列宽/行高等比缩放（等比放进图片盒，居中）。"""
+        if not path or not os.path.exists(path):
+            return col_w * 0.55, img_h * 0.55
+        if path not in dims_cache:
+            try:
+                with Image.open(path) as im:
+                    dims_cache[path] = im.size
+            except Exception:  # noqa: BLE001
+                dims_cache[path] = (800, 600)
+        iw, ih = dims_cache[path]
+        return fit_box(iw, ih, col_w, img_h)
+
+    slides = []
+    for pi, chunk in enumerate(chunks, start=1):
+        first = chunk[0]["index"] if chunk else 0
+        last = chunk[-1]["index"] if chunk else 0
+        title = {"t": "text", "x": MARGIN, "y": TITLE_Y, "w": PAGE_W - 2 * MARGIN,
+                 "h": TITLE_H, "size": IMG_ONLY_TITLE_SIZE, "bold": True, "color": BLACK,
+                 "text": f"{data['name']}    第 {pi}/{n_pages} 页 · 原图 + 方案 {first}~{last} 生成图"}
+        items = [title]
+
+        # 列内容：第 1 列原图，后续每列一个方案
+        cells = [("原图", orig)]
+        for s in chunk:
+            d = (s.get("direction") or "").strip()
+            cells.append((f"方案{s['index']}" + (f" · {d}" if d else ""),
+                          s.get("gen_img") or ""))
+        for ci, (cap, path) in enumerate(cells):
+            x = MARGIN + ci * (col_w + IMG_ONLY_GAP)
+            w, h = _fit(path)
+            items.append({"t": "image", "x": x + (col_w - w) / 2,
+                          "y": CONTENT_Y + (img_h - h) / 2, "w": w, "h": h,
+                          "path": path})
+            items.append({"t": "text", "x": x, "y": CONTENT_Y + img_h + 0.05,
+                          "w": col_w, "h": IMG_ONLY_CAP_H - 0.05, "text": cap,
+                          "size": IMG_ONLY_CAP_SIZE, "bold": (ci == 0),
+                          "color": GRAY, "center": True})
+        slides.append(items)
+    return slides
+
+
 # ---------------------------------------------------------------------------
 # PPTX 渲染
 # ---------------------------------------------------------------------------
@@ -495,7 +568,7 @@ def render_pptx(slides_items, out_path, font_name="Microsoft YaHei"):
                 lines = wrap_text(it["text"], it["w"], it["size"])
                 for i, ln in enumerate(lines):
                     p_ = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                    p_.alignment = PP_ALIGN.LEFT
+                    p_.alignment = PP_ALIGN.CENTER if it.get("center") else PP_ALIGN.LEFT
                     r_ = p_.add_run()
                     r_.text = ln
                     _set_font(r_, font_name, it["size"], it.get("bold", False),
@@ -553,7 +626,10 @@ def render_pdf(slides_items, out_path):
                 c.setFont("STSong-Light", size)
                 c.setFillColorRGB(*it.get("color", BLACK))
                 for ln in lines:
-                    c.drawString(x0, y, ln)
+                    if it.get("center"):
+                        c.drawCentredString(x0 + it["w"] * inch / 2, y, ln)
+                    else:
+                        c.drawString(x0, y, ln)
                     y -= leading
         c.showPage()
     c.save()
@@ -630,13 +706,13 @@ def _thumb_path(path, thumb_dir, max_side=480):
     return out
 
 
-def _prepare_thumbs(slides_items):
+def _prepare_thumbs(slides_items, max_side=480):
     """把所有图片路径换成降采样缩略图，返回临时缩略图目录（用后由调用方清理）。"""
     thumb_dir = tempfile.mkdtemp(prefix="ddge_thumbs_")
     for items in slides_items:
         for it in items:
             if it["t"] == "image" and it.get("path"):
-                it["path"] = _thumb_path(it["path"], thumb_dir)
+                it["path"] = _thumb_path(it["path"], thumb_dir, max_side=max_side)
     return thumb_dir
 
 
@@ -652,6 +728,9 @@ def main():
                     help="输出文件名（不含扩展名，默认=<结果目录名>_报告）")
     ap.add_argument("--skip-pptx", action="store_true", help="不生成 pptx")
     ap.add_argument("--skip-pdf", action="store_true", help="不生成 pdf")
+    ap.add_argument("--layout", choices=["full", "images"], default="full",
+                    help="full=完整版式(证据+分析+建议)；images=仅图片版式"
+                         "(每页4列：原图+3个方案生成图，不展示分析/建议)")
     args = ap.parse_args()
 
     roots = list(args.data_root) or list(DEFAULT_DATA_ROOTS)
@@ -675,15 +754,19 @@ def main():
         data = load_solution_data(folder, roots)
         if args.max_solutions > 0:
             data["solutions"] = data["solutions"][:args.max_solutions]
-        slides = build_slides(data, roots)
+        slides = (build_slides_images_only(data) if args.layout == "images"
+                  else build_slides(data, roots))
         all_slides += slides
         print(f"[make] ({i}/{len(folders)}) {name}: {len(slides)} 页")
 
     out_base = os.path.join(
         save_dir,
-        args.out_name or (os.path.basename(os.path.normpath(args.results_dir)) + "_报告"))
-    print(f"[make] 共 {len(all_slides)} 页，开始渲染 ...")
-    thumb_dir = _prepare_thumbs(all_slides)
+        args.out_name or (os.path.basename(os.path.normpath(args.results_dir))
+                          + ("_图片版报告" if args.layout == "images" else "_报告")))
+    print(f"[make] 版式={args.layout} | 共 {len(all_slides)} 页，开始渲染 ...")
+    # 仅图片版式下图片是主角，用更大的缩略图尺寸保证清晰度
+    thumb_dir = _prepare_thumbs(all_slides,
+                                max_side=(1400 if args.layout == "images" else 480))
     try:
         if not args.skip_pptx:
             render_pptx(all_slides, out_base + ".pptx")

@@ -136,6 +136,39 @@ def _check_device_supported() -> None:
 
 _check_device_supported()
 
+# ---------------------------------------------------------------------------
+# torchaudio ABI 兼容保险（升级 torch 后常见）：
+#   torch 升到 2.12+（如 2.12.1+cu130）后，旧 torchaudio（如 2.7.0+cu128）会因
+#   C++ 符号不匹配而导入失败（OSError: undefined symbol ... libtorchaudio.so）；
+#   而 transformers 的 audio_utils 会无条件 `import torchaudio`，导致整条视觉链路
+#   （本工程只做图像/文本，不用音频）连带 import 失败。
+#   官方 torchaudio 已停止发版（PyPI 最高 2.11.0，无 2.12+ 配对版本），故这里在
+#   导入 transformers 之前探测真实 torchaudio，不可用时注入轻量 stub。
+#   若将来需要音频功能：改用 torchcodec / soundfile，或把 torch 降到与 torchaudio 匹配。
+# ---------------------------------------------------------------------------
+try:  # noqa: SIM105
+    import torchaudio  # noqa: F401
+except Exception as _ta_err:  # noqa: BLE001
+    import sys as _sys
+    import types as _types
+    import importlib.machinery as _machinery
+    _ta_stub = _types.ModuleType("torchaudio")
+    _ta_stub.__version__ = "0.0.0-stub"
+    # 让 importlib.util.find_spec("torchaudio") 正常返回（transformers 会调用它做
+    # is_torchaudio_available 判断），否则会抛 ValueError: torchaudio.__spec__ is None
+    _ta_stub.__spec__ = _machinery.ModuleSpec("torchaudio", loader=None)
+    _ta_stub.__loader__ = None
+
+    def _ta_missing(name):  # noqa: ANN001
+        raise AttributeError(
+            f"torchaudio 当前不可用（stub 模块），无法访问 {name}；"
+            "本工程不使用音频功能，如需音频请安装与 torch 匹配的 torchaudio")
+
+    _ta_stub.__getattr__ = _ta_missing
+    _sys.modules["torchaudio"] = _ta_stub
+    print(f"[encoder] torchaudio 不可用（{type(_ta_err).__name__}: {_ta_err}），"
+          "已注入 stub（本工程不使用音频功能）", flush=True)
+
 # 可用 VL 生成类注册表（按权重 config.json 的 model_type 精确匹配，
 # 避免 Qwen3-VL 优先命中后拿错类去加载 Qwen2-VL 等不同结构权重）
 try:

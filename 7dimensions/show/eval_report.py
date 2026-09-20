@@ -8,7 +8,7 @@
 支持输出 PDF 与 PPTX（默认都出；可 --skip-pdf / --skip-pptx）。
 
 用法：
-  python eval_report.py --verdicts-dir /workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval/raw --out /workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval
+  python eval_report.py --verdicts-dir /workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash/gpt54_eval/raw --out /workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash/gpt54_eval  --solutions_dir /workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash
   python eval_report.py --verdicts-dir .../raw --only 0249a71 --skip-pptx   # 只出 1 张的 pdf
 """
 from __future__ import annotations
@@ -186,7 +186,7 @@ def render_pdf(items, out_path: str, page_size=(13.333, 7.5)):
             canvas.setFont(FONT, 7.5)
             canvas.setFillColor(colors.HexColor("#57606a"))
             canvas.drawString(0.25 * inch, 0.25 * inch,
-                              "左：原图  |  右：qwen 评估（原·缺陷分析/建议 + label + reason）")
+                              "左：原图  |  右： 评估（原·缺陷分析/建议 + label + reason）")
             canvas.restoreState()
         return _draw
 
@@ -556,6 +556,7 @@ def main() -> None:
     ap.add_argument("--skip-pdf", action="store_true")
     ap.add_argument("--skip-pptx", action="store_true")
     ap.add_argument("--out-name", default=None)
+    ap.add_argument("--solutions_dir", default=None)
     args = ap.parse_args()
 
     items = collect_verdicts(args.verdicts_dir, only=args.only)

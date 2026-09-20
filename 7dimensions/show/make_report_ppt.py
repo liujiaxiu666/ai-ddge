@@ -16,9 +16,9 @@ prompt 的 good 图 / dim_original_text）以及 solutions（每个 direction �
   第 4 页右侧 ：上方 = 维度7 Color；下方 = 该方案完整的“针对性整改建议”
 
 用法（整批 -> 单份报告，保存到输入测试路径）：
-  python make_ppt_0901.py \
-      --results-dir /workspace/ai-ddge/7dimensions/output/0907_sv_FIRST_GOOD_PER_POOR \
-      --save-dir   /workspace/ai-ddge/7dimensions/output/0907_sv_FIRST_GOOD_PER_POOR \
+  python make_report_ppt.py \
+      --results-dir /workspace/ai-ddge/7dimensions/output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1 \
+      --save-dir   /workspace/ai-ddge/7dimensions/output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1 \
       --data-root  /workspace/ai-ddge/7dimensions/dataset
   # 可选：--only "669da389b6114a208175994fa13af3fe" 只处理某一张
   #       --max-solutions 3 每张只取前 N 个方案

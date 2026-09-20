@@ -26,8 +26,8 @@ import matplotlib.ticker as mticker
 #                         "dimension_stats.csv")
 # OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CSV_PATH = "/workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval/dimension_stats.csv"
-OUT_DIR = "/workspace/ai-ddge/7dimensions/output/0909_no_rag/qwen_eval"
+CSV_PATH = "/workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash/gpt54_eval/dimension_stats.csv"
+OUT_DIR = "/workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash/gpt54_eval"
 
 
 def _pick_label(csv_path: str) -> str:

@@ -1,10 +1,15 @@
 """
-0830 批次各阶段时延统计（基于 output/0830 每个图片文件夹 solutions.json 的 timing_s）
+各批次阶段时延统计（基于 RESULTS_DIR 下每个图片文件夹 solutions.json 的 timing_s）
 - 阶段：retrieval（检索）、vlm_generation（VLM 生成）、image_edit（图像编辑）、total（总耗时）
 - 输出每个阶段的 均值/中位数/最小/最大/标准差 及样本数，并生成柱状图与箱线图
-- 说明：该批次 image_edit 全为 0（未启用图编），故 total = retrieval + vlm_generation
+- 图表标题与文件名都按 RESULTS_DIR（批次目录名）自动生成，换目录即换标题/文件名
+
+用法：
+  python ppt_analyze_local_timings.py                        # 用脚本顶部 RESULTS_DIR
+  python ppt_analyze_local_timings.py --results-dir <目录>     # 临时换批次（标题/文件名随之变化）
 """
 
+import argparse
 import json
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -22,8 +27,11 @@ for font_path in ['/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
         break
 
 # ==================== 配置 ====================
-RESULTS_DIR = Path('/workspace/ai-ddge/7dimensions/output/0901')  # 测试结果目录
+RESULTS_DIR = Path('/workspace/ai-ddge/7dimensions/output/0910_sv_FIRST_GOOD_PER_POOR_qwen38flash1')  # 测试结果目录
 OUTPUT_DIR = RESULTS_DIR                                           # 图表保存到结果目录下
+# ★ 批次名 / 图表文件名前缀：从 RESULTS_DIR 目录名自动取（如 0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash）
+BATCH = RESULTS_DIR.name
+FIG_PREFIX = BATCH
 STAGES = ['retrieval', 'vlm_generation', 'image_edit', 'total']
 STAGE_CN = {
     'retrieval': '检索 Retrieval',
@@ -88,10 +96,23 @@ def compute_stats(cases, stage):
 
 # ==================== 主函数 ====================
 def main():
-    cases = collect_cases(RESULTS_DIR)
+    ap = argparse.ArgumentParser(description="阶段时延统计（标题/文件名随 RESULTS_DIR 自动变化）")
+    ap.add_argument("--results-dir", default=str(RESULTS_DIR),
+                    help="测试结果目录（默认=脚本顶部 RESULTS_DIR）")
+    ap.add_argument("--out-dir", default=None, help="图表输出目录（默认=RESULTS_DIR）")
+    ap.add_argument("--tag", default=None, help="图表标题/文件名里的批次名（默认=结果目录名）")
+    args = ap.parse_args()
+
+    results_dir = Path(args.results_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else results_dir
+    batch = args.tag or results_dir.name          # ★ 动态批次名：标题与文件名都用它
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cases = collect_cases(results_dir)
     if not cases:
         print("❌ 没有有效的 case 数据，退出。")
         return
+    print(f"✅ 批次={batch} | 目录={results_dir}")
     print(f"✅ 共读取 {len(cases)} 个有效 case（每个来自一个图片文件夹的 solutions.json）")
 
     # ---------- 打印统计表 ----------
@@ -108,7 +129,12 @@ def main():
         print(f"{STAGE_CN[stage]:<30}{st['n']:>4}{st['mean']:>9.2f}s{st['median']:>9.2f}s"
               f"{st['min']:>7.2f}s{st['max']:>7.2f}s{st['std']:>9.2f}s")
     print("=" * 78)
-    print("说明：该批次 image_edit 全为 0（未启用图编），因此 total ≈ retrieval + vlm_generation")
+    n_edit0 = sum(1 for c in cases if not (c.get('image_edit') or 0))
+    if n_edit0 == len(cases):
+        print("说明：该批次 image_edit 全为 0（未启用图编），因此 total ≈ retrieval + vlm_generation")
+    else:
+        print(f"说明：该批次已启用图编（{len(cases) - n_edit0}/{len(cases)} 个 case 有图编耗时），"
+              "total = retrieval + vlm_generation + image_edit")
 
     # total 自洽性校验（允许 0.01s 的 JSON 两位小数舍入误差）
     checked = mismatch = 0
@@ -136,7 +162,7 @@ def main():
                 fmt='none', ecolor='#d62728', capsize=6, label='Min-Max range')
 
     ax.set_ylabel('Latency (s)')
-    ax.set_title(f'Stage Timing Stats - 0830 batch (N={len(cases)})')
+    ax.set_title(f'Stage Timing Stats - {batch} (N={len(cases)})')
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.legend()
@@ -146,7 +172,7 @@ def main():
                 ha='center', va='bottom', fontsize=10)
 
     plt.tight_layout()
-    out_bar = OUTPUT_DIR / '0830_stage_timing_stats.png'
+    out_bar = out_dir / f'{batch}_stage_timing_stats.png'
     plt.savefig(out_bar, dpi=150)
     plt.close()
     print(f"\n✅ 各阶段时延统计图已保存: {out_bar}")
@@ -159,10 +185,10 @@ def main():
     ax.set_xticks(range(1, len(labels) + 1))
     ax.set_xticklabels(labels)
     plt.ylabel('Latency (s)')
-    plt.title(f'Stage Timing Distribution - 0830 batch (N={len(cases)})')
+    plt.title(f'Stage Timing Distribution - {batch} (N={len(cases)})')
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    out_box = OUTPUT_DIR / '0830_stage_timing_boxplot.png'
+    out_box = out_dir / f'{batch}_stage_timing_boxplot.png'
     plt.savefig(out_box, dpi=150)
     plt.close()
     print(f"✅ 各阶段时延箱线图已保存: {out_box}")

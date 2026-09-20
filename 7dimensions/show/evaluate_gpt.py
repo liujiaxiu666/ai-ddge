@@ -36,8 +36,8 @@ HTTPS_PROXY=http://127.0.0.1:30000 python evaluate_gpt.py \
 
 cd /workspace/ai-ddge/7dimensions/show
 HTTPS_PROXY=http://127.0.0.1:30000 python evaluate_gpt.py \
-  --results-dir /workspace/ai-ddge/7dimensions/output/0907_sv \
-  --out-dir     /workspace/ai-ddge/7dimensions/output/0907_sv/gpt54_eval \
+  --results-dir /workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash \
+  --out-dir     /workspace/ai-ddge/7dimensions/output/0915_sv_FIRST_GOOD_PER_POOR_qwen3vlflash/gpt54_eval \
   --provider openai --model gpt-5.4 --concurrency 3 --limit 10
 
 """
